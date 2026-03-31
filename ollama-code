@@ -105,18 +105,18 @@ SLASH_COMMANDS = [
 ]
 
 SLASH_COMMAND_DESCRIPTIONS = {
-    "/f": "lista file",
+    "/f": "list files",
     "/s": "shell",
     "/diff": "diff git",
-    "/model": "cambia modello",
-    "/plan": "toggle piano",
+    "/model": "change model",
+    "/plan": "toggle planning",
     "/dry": "toggle dry-run",
     "/commit": "toggle commit",
-    "/engine": "toggle motore 5 passi",
-    "/retry": "ripete l'ultima richiesta",
-    "/last": "mostra ultima risposta",
-    "/history": "mostra richieste recenti",
-    "/q": "esce",
+    "/engine": "toggle 5-pass engine",
+    "/retry": "repeat last request",
+    "/last": "show last response",
+    "/history": "show recent requests",
+    "/q": "quit",
 }
 
 SLASH_TOGGLE_COMMANDS = {"/plan", "/dry", "/commit", "/engine"}
@@ -154,13 +154,13 @@ BACKUP_DIRS = {
 }
 
 SKIP_REASON_LABELS = {
-    "internal_state": "file interni di ollama-code",
+    "internal_state": "ollama-code internal files",
     "symlink": "symlink",
-    "excluded_dir": "cartelle escluse",
-    "backup_dir": "cartelle di backup",
-    "binary_suffix": "file binari",
-    "too_large": "file troppo grandi",
-    "stat_error": "file illeggibili",
+    "excluded_dir": "excluded directories",
+    "backup_dir": "backup directories",
+    "binary_suffix": "binary files",
+    "too_large": "oversized files",
+    "stat_error": "unreadable files",
 }
 
 BLOCK_RE = re.compile(
@@ -191,6 +191,29 @@ class AppliedPassResult:
     validation_failures: list[str] = field(default_factory=list)
     no_changes: bool = False
     valid_response: bool = True
+
+
+@dataclass
+class UsageSnapshot:
+    model: str = ""
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_duration_ns: int = 0
+    load_duration_ns: int = 0
+    prompt_duration_ns: int = 0
+    completion_duration_ns: int = 0
+
+
+@dataclass
+class SessionUsageState:
+    last_resolved_model: str | None = None
+    last_target_was_cloud: bool = False
+    last_cloud_usage: UsageSnapshot | None = None
+    cloud_calls: int = 0
+    cloud_usage_duration_ns: int = 0
+
+
+_SESSION_USAGE = SessionUsageState()
 
 
 def ansi_wrap(seq: str) -> str:
@@ -259,7 +282,7 @@ class SlashCommandCompleter(Completer):
             )
             for model_name in model_choices:
                 if model_name.lower().startswith(current_arg_lower):
-                    yield Completion(model_name, start_position=-len(current_arg), display_meta="modello")
+                    yield Completion(model_name, start_position=-len(current_arg), display_meta="model")
 
 
 def get_prompt_session():
@@ -286,11 +309,13 @@ def prompt_input(prompt_text: str, color: str, completer=None) -> str:
     if session is None:
         return input(cprompt(prompt_text, color))
 
+    toolbar = build_prompt_toolbar()
     value = session.prompt(
         ANSI(cansi(prompt_text, color)),
         completer=completer,
         complete_while_typing=completer is not None,
         reserve_space_for_menu=8,
+        bottom_toolbar=toolbar,
     )
     if value.strip():
         readline.add_history(value)
@@ -338,11 +363,11 @@ def ensure_git_repo() -> Path:
     if not (cwd / ".git").exists():
         cp = run(["git", "init"], check=False)
         if cp.returncode != 0:
-            print(c("Errore durante git init", RED), file=sys.stderr)
+            print(c("Error during git init", RED), file=sys.stderr)
             if cp.stderr:
                 print(cp.stderr, file=sys.stderr)
             sys.exit(1)
-        print(c("Repository git inizializzata.", GREEN))
+        print(c("Git repository initialized.", GREEN))
 
     try:
         cp = run(["git", "rev-parse", "--show-toplevel"], check=True)
@@ -352,13 +377,13 @@ def ensure_git_repo() -> Path:
 
 
 def show_ls(root: Path) -> None:
-    print(c(f"Cartella corrente: {root}", BOLD + BLUE) + "\n")
+    print(c(f"Current directory: {root}", BOLD + BLUE) + "\n")
     cp = run(["ls", "-1A"], check=False)
     out = cp.stdout.strip()
     if out:
         print(out)
     else:
-        print(c("(cartella vuota)", MUTED))
+        print(c("(empty directory)", MUTED))
     print()
 
 
@@ -371,7 +396,7 @@ def list_files(root: Path) -> None:
     if out:
         print(out)
     else:
-        print(c("(nessun file)", MUTED))
+        print(c("(no files)", MUTED))
 
 
 def run_shell_command(arg: str | None = None) -> None:
@@ -380,7 +405,7 @@ def run_shell_command(arg: str | None = None) -> None:
         cmd = input(cprompt("shell> ", YELLOW)).strip()
 
     if not cmd:
-        print(c("Nessun comando.", YELLOW))
+        print(c("No command.", YELLOW))
         return
 
     print(c(f"$ {cmd}", CYAN) + "\n")
@@ -396,32 +421,32 @@ def show_git_diff() -> None:
     cp1 = run(["git", "diff"], check=False)
     out1 = cp1.stdout.strip()
     if out1:
-        print(c("--- DIFF NON STAGED ---", BOLD + GREEN))
+        print(c("--- UNSTAGED DIFF ---", BOLD + GREEN))
         print(out1)
     else:
-        print(c("Nessun diff non staged.", YELLOW))
+        print(c("No unstaged diff.", YELLOW))
 
     cp2 = run(["git", "diff", "--cached"], check=False)
     out2 = cp2.stdout.strip()
     if out2:
-        print(c("\n--- DIFF IN STAGE ---\n", BOLD + GREEN))
+        print(c("\n--- STAGED DIFF ---\n", BOLD + GREEN))
         print(out2)
 
 
 def show_written_files_diff(written: list[str]) -> None:
     files = [f for f in written if f not in INTERNAL_STATE_FILES]
     if not files:
-        print(c("Nessun file modificato da mostrare nel diff.", YELLOW))
+        print(c("No modified files to show in the diff.", YELLOW))
         return
 
     cp = run(["git", "diff", "--", *files], check=False)
     out = cp.stdout.strip()
 
-    print(c("\n--- DIFF FILE MODIFICATI ---\n", BOLD + GREEN))
+    print(c("\n--- MODIFIED FILES DIFF ---\n", BOLD + GREEN))
     if out:
         print(out)
     else:
-        print(c("Nessun diff disponibile.", YELLOW))
+        print(c("No diff available.", YELLOW))
 
 
 def is_valid_relpath(name: str) -> bool:
@@ -474,7 +499,7 @@ def is_probably_binary(path: Path) -> bool:
 
 def read_file_safely(path: Path) -> tuple[str, bool]:
     if is_probably_binary(path):
-        return "[FILE NON TESTUALE O BINARIO]", False
+        return "[NON-TEXT OR BINARY FILE]", False
 
     try:
         text = path.read_text(encoding="utf-8")
@@ -482,13 +507,13 @@ def read_file_safely(path: Path) -> tuple[str, bool]:
         try:
             text = path.read_text(encoding="latin-1")
         except Exception:
-            return "[FILE NON TESTUALE O NON LEGGIBILE]", False
+            return "[NON-TEXT OR UNREADABLE FILE]", False
     except Exception:
-        return "[FILE NON LEGGIBILE]", False
+        return "[UNREADABLE FILE]", False
 
     truncated = False
     if len(text) > MAX_FILE_CHARS:
-        text = text[:MAX_FILE_CHARS] + "\n...[TRONCATO]...\n"
+        text = text[:MAX_FILE_CHARS] + "\n...[TRUNCATED]...\n"
         truncated = True
     return text, truncated
 
@@ -517,6 +542,46 @@ def summarize_items(items: list[str], max_items: int = 3) -> str:
 
 def format_count(value: int) -> str:
     return f"{value:,}".replace(",", ".")
+
+
+def safe_int(value: object) -> int:
+    try:
+        parsed = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return max(parsed, 0)
+
+
+def format_duration_ns(value: int) -> str:
+    if value <= 0:
+        return "0s"
+
+    seconds = value / 1_000_000_000
+    if seconds < 10:
+        return f"{seconds:.1f}s"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+
+    minutes, seconds = divmod(int(round(seconds)), 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def cloud_usage_duration_ns(snapshot: UsageSnapshot | None) -> int:
+    if snapshot is None:
+        return 0
+
+    component_total = (
+        snapshot.load_duration_ns
+        + snapshot.prompt_duration_ns
+        + snapshot.completion_duration_ns
+    )
+    if component_total > 0:
+        return component_total
+    return snapshot.total_duration_ns
 
 
 def iter_project_files(root: Path) -> list[Path]:
@@ -561,7 +626,7 @@ def collect_project_context(root: Path) -> tuple[str, ProjectContextStats]:
         if total + len(chunk) > MAX_PROMPT_CHARS:
             remaining = MAX_PROMPT_CHARS - total
             if remaining > 200:
-                chunk = chunk[:remaining] + "\n...[CONTESTO TRONCATO]...\n"
+                chunk = chunk[:remaining] + "\n...[CONTEXT TRUNCATED]...\n"
                 chunks.append(chunk)
                 total += len(chunk)
             stats.context_truncated = True
@@ -650,12 +715,12 @@ def build_request_history_context(root: Path) -> str:
 
     if older:
         recent_older = older[-MAX_HISTORY_SUMMARY_ITEMS:]
-        parts.append("STORIA RIASSUNTA DELLE RICHIESTE PRECEDENTI:")
+        parts.append("SUMMARIZED PREVIOUS REQUEST HISTORY:")
         for ts, text in recent_older:
             parts.append(f"- [{ts}] {one_line_summary(text)}")
 
     parts.append("")
-    parts.append("ULTIMA RICHIESTA PRECEDENTE COMPLETA:")
+    parts.append("LAST FULL PREVIOUS REQUEST:")
     parts.append(f"[{last_timestamp}]")
     parts.append(last_text)
 
@@ -673,7 +738,7 @@ def build_request_history_context(root: Path) -> str:
 def show_request_history(root: Path) -> None:
     entries = parse_request_history_entries(root)
     if not entries:
-        print(c("Nessuna storia richieste disponibile.", YELLOW))
+        print(c("No request history available.", YELLOW))
         return
 
     history_path = first_existing_state_path(root, REQUEST_HISTORY_FILE, LEGACY_REQUEST_HISTORY_FILE)
@@ -694,16 +759,16 @@ def preview_text(text: str, max_chars: int = 280) -> str:
 def show_context_summary(stats: ProjectContextStats) -> None:
     included = len(stats.included_files)
     print(c(
-        f"Contesto progetto pronto: {included} file inclusi, {format_count(stats.total_chars)} caratteri.",
+        f"Project context ready: {included} files included, {format_count(stats.total_chars)} characters.",
         CYAN,
     ))
 
     if stats.included_files:
-        print(c(f"File inclusi: {summarize_items(stats.included_files, max_items=6)}", MUTED))
+        print(c(f"Included files: {summarize_items(stats.included_files, max_items=6)}", MUTED))
 
     if stats.truncated_files:
         print(c(
-            f"File troncati a {format_count(MAX_FILE_CHARS)} caratteri: {summarize_items(stats.truncated_files)}",
+            f"Files truncated to {format_count(MAX_FILE_CHARS)} characters: {summarize_items(stats.truncated_files)}",
             YELLOW,
         ))
 
@@ -712,13 +777,13 @@ def show_context_summary(stats: ProjectContextStats) -> None:
         label = SKIP_REASON_LABELS.get(reason, reason)
         examples = summarize_items(stats.skipped_examples.get(reason, []))
         if examples:
-            print(c(f"Saltati {count} {label}: {examples}", MUTED))
+            print(c(f"Skipped {count} {label}: {examples}", MUTED))
         else:
-            print(c(f"Saltati {count} {label}.", MUTED))
+            print(c(f"Skipped {count} {label}.", MUTED))
 
     if stats.context_truncated:
         print(c(
-            f"Contesto totale troncato a circa {format_count(MAX_PROMPT_CHARS)} caratteri.",
+            f"Total context truncated to about {format_count(MAX_PROMPT_CHARS)} characters.",
             YELLOW,
         ))
 
@@ -755,11 +820,11 @@ def load_config_file(path: Path) -> dict[str, str | None] | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        print(c(f"Impossibile leggere {path}: {exc}", YELLOW), file=sys.stderr)
+        print(c(f"Unable to read {path}: {exc}", YELLOW), file=sys.stderr)
         return None
 
     if not isinstance(data, dict):
-        print(c(f"{path} non contiene un oggetto JSON valido.", YELLOW), file=sys.stderr)
+        print(c(f"{path} does not contain a valid JSON object.", YELLOW), file=sys.stderr)
         return None
 
     config = build_runtime_config()
@@ -799,7 +864,7 @@ def save_config(_root: Path, config: dict[str, str | None]) -> None:
             encoding="utf-8",
         )
     except Exception as exc:
-        print(c(f"Impossibile salvare {path}: {exc}", RED), file=sys.stderr)
+        print(c(f"Unable to save {path}: {exc}", RED), file=sys.stderr)
 
 
 def format_model_name(model: str | None) -> str:
@@ -809,9 +874,9 @@ def format_model_name(model: str | None) -> str:
 
     default_model = default_model_choice()
     if default_model:
-        return f"automatico ({default_model})"
+        return f"automatic ({default_model})"
 
-    return "automatico"
+    return "automatic"
 
 
 def default_ollama_url(raw: str | None = None) -> str:
@@ -826,6 +891,31 @@ def default_ollama_url(raw: str | None = None) -> str:
 def is_cloud_model(model: str) -> bool:
     lowered = model.strip().lower()
     return lowered.endswith(":cloud") or lowered.endswith("-cloud")
+
+
+def is_ollama_cloud_url(ollama_url: str | None) -> bool:
+    host = (urllib.parse.urlparse(default_ollama_url(ollama_url)).hostname or "").lower()
+    return host == "ollama.com" or host.endswith(".ollama.com")
+
+
+def is_cloud_target(model: str | None, ollama_url: str | None) -> bool:
+    normalized = normalize_model_value(model)
+    return bool(normalized and is_cloud_model(normalized)) or is_ollama_cloud_url(ollama_url)
+
+
+def sync_session_usage_target(model: str | None, ollama_url: str | None) -> None:
+    global _SESSION_USAGE
+
+    resolved = normalize_model_value(model) or default_model_choice()
+    _SESSION_USAGE.last_resolved_model = resolved
+    _SESSION_USAGE.last_target_was_cloud = is_cloud_target(resolved, ollama_url)
+    if (
+        resolved
+        and _SESSION_USAGE.last_cloud_usage is not None
+        and _SESSION_USAGE.last_cloud_usage.model
+        and _SESSION_USAGE.last_cloud_usage.model != resolved
+    ):
+        _SESSION_USAGE.last_cloud_usage = None
 
 
 def pick_auto_model(models: list[str]) -> str | None:
@@ -861,8 +951,8 @@ def resolve_active_model(model: str | None, ollama_url: str | None = None) -> st
 def format_ollama_target(model: str | None, ollama_url: str | None = None) -> str:
     active_model = resolve_active_model(model, ollama_url)
     if active_model:
-        return f"motore: ollama, modello: {active_model}"
-    return "motore: ollama, modello: non configurato"
+        return f"engine: ollama, model: {active_model}"
+    return "engine: ollama, model: not configured"
 
 
 def show_model_status(model: str | None, ollama_url: str | None = None) -> None:
@@ -870,14 +960,89 @@ def show_model_status(model: str | None, ollama_url: str | None = None) -> None:
     active_model = resolve_active_model(model, ollama_url)
 
     if explicit_model:
-        print(c(f"Modello: {explicit_model}", GREEN))
+        print(c(f"Model: {explicit_model}", GREEN))
         return
 
     if active_model:
-        print(c(f"Modello: automatico ({active_model})", YELLOW))
+        print(c(f"Model: automatic ({active_model})", YELLOW))
         return
 
-    print(c("Modello: automatico (nessun modello Ollama disponibile)", RED))
+    print(c("Model: automatic (no Ollama model available)", RED))
+
+
+def usage_snapshot_from_response(data: object, active_model: str | None) -> UsageSnapshot | None:
+    if not isinstance(data, dict):
+        return None
+
+    snapshot = UsageSnapshot(
+        model=normalize_model_value(data.get("model")) or normalize_model_value(active_model) or "",
+        prompt_tokens=safe_int(data.get("prompt_eval_count")),
+        completion_tokens=safe_int(data.get("eval_count")),
+        total_duration_ns=safe_int(data.get("total_duration")),
+        load_duration_ns=safe_int(data.get("load_duration")),
+        prompt_duration_ns=safe_int(data.get("prompt_eval_duration")),
+        completion_duration_ns=safe_int(data.get("eval_duration")),
+    )
+
+    if not any((
+        snapshot.prompt_tokens,
+        snapshot.completion_tokens,
+        snapshot.total_duration_ns,
+        snapshot.load_duration_ns,
+        snapshot.prompt_duration_ns,
+        snapshot.completion_duration_ns,
+    )):
+        return None
+
+    return snapshot
+
+
+def record_response_usage(data: object, active_model: str | None, ollama_url: str | None) -> None:
+    global _SESSION_USAGE
+
+    _SESSION_USAGE.last_resolved_model = normalize_model_value(active_model)
+    _SESSION_USAGE.last_target_was_cloud = is_cloud_target(active_model, ollama_url)
+
+    snapshot = usage_snapshot_from_response(data, active_model)
+    if snapshot is None or not _SESSION_USAGE.last_target_was_cloud:
+        return
+
+    _SESSION_USAGE.last_cloud_usage = snapshot
+    _SESSION_USAGE.cloud_calls += 1
+    _SESSION_USAGE.cloud_usage_duration_ns += cloud_usage_duration_ns(snapshot)
+
+
+def build_prompt_toolbar() -> ANSI | None:
+    if ANSI is None:
+        return None
+
+    usage = _SESSION_USAGE
+    if not usage.last_target_was_cloud:
+        return None
+
+    model_label = usage.last_resolved_model or "automatic"
+    snapshot = usage.last_cloud_usage
+
+    if snapshot is None:
+        if usage.cloud_calls > 0:
+            text = (
+                f" cloud {model_label}"
+                " | current model: no usage yet"
+                f" | session usage {format_duration_ns(usage.cloud_usage_duration_ns)}"
+                f" | {usage.cloud_calls} calls "
+            )
+        else:
+            text = f" cloud {model_label} | usage: no data yet "
+        return ANSI(cansi(text, MUTED))
+
+    last_usage = cloud_usage_duration_ns(snapshot)
+    text = (
+        f" cloud {snapshot.model or model_label}"
+        f" | last usage {format_duration_ns(last_usage)}"
+        f" | session usage {format_duration_ns(usage.cloud_usage_duration_ns)}"
+        f" | {usage.cloud_calls} calls "
+    )
+    return ANSI(cansi(text, CYAN))
 
 
 def unique_preserve(values: list[str]) -> list[str]:
@@ -902,6 +1067,31 @@ def unique_preserve(values: list[str]) -> list[str]:
 def fetch_json(url: str, headers: dict[str, str] | None = None) -> object | None:
     data, _ = request_json(url, headers=headers)
     return data
+
+
+def build_ollama_headers(ollama_url: str | None = None) -> dict[str, str] | None:
+    if not is_ollama_cloud_url(ollama_url):
+        return None
+
+    api_key = os.getenv("OLLAMA_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    return {"Authorization": f"Bearer {api_key}"}
+
+
+def build_ollama_api_url(ollama_url: str | None, endpoint: str) -> str:
+    base_url = default_ollama_url(ollama_url)
+    parsed = urllib.parse.urlparse(base_url)
+    base_path = parsed.path.rstrip("/")
+    endpoint_path = endpoint if endpoint.startswith("/") else f"/{endpoint}"
+
+    if base_path.endswith("/api"):
+        path = base_path + endpoint_path
+    else:
+        path = f"{base_path}/api{endpoint_path}" if base_path else f"/api{endpoint_path}"
+
+    return urllib.parse.urlunparse(parsed._replace(path=path))
 
 
 def request_json(
@@ -950,12 +1140,12 @@ def request_json(
     try:
         return json.loads(raw_text), None
     except json.JSONDecodeError:
-        return None, raw_text or "Risposta JSON non valida"
+        return None, raw_text or "Invalid JSON response"
 
 
 def discover_ollama_models(ollama_url: str | None = None) -> list[str]:
     url = default_ollama_url(ollama_url)
-    data = fetch_json(f"{url}/api/tags")
+    data = fetch_json(build_ollama_api_url(url, "/tags"), headers=build_ollama_headers(url))
     models: list[str] = []
 
     if isinstance(data, dict):
@@ -993,8 +1183,8 @@ def discover_model_choices(
 
     if not discovered:
         note = (
-            "Ollama non risponde o non espone modelli installati. "
-            "Puoi inserire un modello manualmente oppure configurare OLLAMA_MODEL."
+            "Ollama is not responding or is not exposing installed models. "
+            "You can enter a model name manually or set OLLAMA_MODEL."
         )
 
     combined = unique_preserve(
@@ -1041,18 +1231,18 @@ def prompt_model_selection(
 ) -> tuple[bool, str | None]:
     models, note, allow_custom = discover_model_choices(ollama_url, current_model)
 
-    print(c("Modelli disponibili per Ollama:", BOLD + BLUE))
+    print(c("Available Ollama models:", BOLD + BLUE))
 
-    default_tags: list[str] = ["automatico"]
+    default_tags: list[str] = ["automatic"]
     if current_model is None:
-        default_tags.append("corrente")
+        default_tags.append("current")
     print(f" 0. {format_model_name(None)} ({', '.join(default_tags)})")
 
     env_model = default_model_choice()
     for idx, model in enumerate(models, start=1):
         tags: list[str] = []
         if model == current_model:
-            tags.append("corrente")
+            tags.append("current")
         if env_model and model == env_model:
             tags.append("OLLAMA_MODEL")
 
@@ -1062,46 +1252,46 @@ def prompt_model_selection(
     if note:
         print(c(note, MUTED))
 
-    print(c("Scrivi nome, numero o 'default'. Puoi anche inserire un modello manualmente. Invio vuoto per annullare.", MUTED))
+    print(c("Type a name, number, or 'default'. You can also enter a custom model name. Press enter to cancel.", MUTED))
 
     while True:
         choice = input(cprompt("model> ", YELLOW)).strip()
         if not choice:
-            print(c("Selezione modello annullata.", YELLOW))
+            print(c("Model selection canceled.", YELLOW))
             return False, None
 
         ok, selected = resolve_model_choice(choice, models, allow_custom)
         if ok:
             return True, selected
 
-        print(c("Modello non valido. Riprova o premi invio per annullare.", RED))
+        print(c("Invalid model. Try again or press enter to cancel.", RED))
 
 
 def build_plan_prompt(project_text: str, request: str, request_history: str = "") -> str:
     history_section = ""
     if request_history.strip():
-        history_section = f"STORIA RECENTE DELLE RICHIESTE:\n{request_history.strip()}\n\n"
+        history_section = f"RECENT REQUEST HISTORY:\n{request_history.strip()}\n\n"
 
     return (
-        "Sei un coding agent da terminale.\n"
-        "Ti passo i file attuali del progetto e poi una nuova richiesta.\n"
-        "Prima di modificare il codice devi produrre un piano operativo.\n"
-        "Rispondi SOLO in testo semplice, senza markdown e senza blocchi ```.\n\n"
-        "FORMATO:\n"
-        "PIANO:\n"
-        "- obiettivo\n"
-        "- file da modificare\n"
-        "- modifiche previste\n"
-        "- rischi\n"
-        "- controlli sintattici consigliati\n\n"
-        "REGOLE:\n"
-        "- nessuna spiegazione finale\n"
-        "- nessun testo fuori dal piano\n"
-        "- sii concreto e breve\n\n"
+        "You are a terminal coding agent.\n"
+        "I will give you the current project files and then a new request.\n"
+        "Before changing code, you must produce an execution plan.\n"
+        "Reply ONLY in plain text, with no markdown and no ``` blocks.\n\n"
+        "FORMAT:\n"
+        "PLAN:\n"
+        "- objective\n"
+        "- files to modify\n"
+        "- expected changes\n"
+        "- risks\n"
+        "- suggested syntax checks\n\n"
+        "RULES:\n"
+        "- no final explanation\n"
+        "- no text outside the plan\n"
+        "- be concrete and brief\n\n"
         f"{history_section}"
-        "FILE ATTUALI DEL PROGETTO:\n\n"
+        "CURRENT PROJECT FILES:\n\n"
         f"{project_text}\n\n"
-        "NUOVA RICHIESTA:\n\n"
+        "NEW REQUEST:\n\n"
         f"{request}\n"
     )
 
@@ -1112,13 +1302,13 @@ def build_validation_feedback(
     failures: list[str],
 ) -> str:
     if not reports and not failures:
-        return "ESITO: nessun file validabile"
+        return "RESULT: no validatable files"
 
-    parts = [f"ESITO: {'OK' if ok else 'ERRORI'}"]
+    parts = [f"RESULT: {'OK' if ok else 'ERRORS'}"]
     if reports:
         parts.append("REPORT:\n" + "\n".join(reports))
     if failures:
-        parts.append("ERRORI:\n" + "\n\n".join(failures))
+        parts.append("ERRORS:\n" + "\n\n".join(failures))
     return "\n\n".join(parts).strip()
 
 
@@ -1134,53 +1324,53 @@ def build_code_prompt(
 ) -> str:
     plan_section = ""
     if plan_text.strip():
-        plan_section = f"PIANO PRECEDENTE:\n{plan_text.strip()}\n\n"
+        plan_section = f"PREVIOUS PLAN:\n{plan_text.strip()}\n\n"
 
     history_section = ""
     if request_history.strip():
-        history_section = f"STORIA RECENTE DELLE RICHIESTE:\n{request_history.strip()}\n\n"
+        history_section = f"RECENT REQUEST HISTORY:\n{request_history.strip()}\n\n"
 
     review_section = ""
     if review_text.strip():
-        review_section = f"REVISIONE PRECEDENTE:\n{review_text.strip()}\n\n"
+        review_section = f"PREVIOUS REVIEW:\n{review_text.strip()}\n\n"
 
     validation_section = ""
     if validation_text.strip():
-        validation_section = f"VALIDAZIONE RECENTE:\n{validation_text.strip()}\n\n"
+        validation_section = f"RECENT VALIDATION:\n{validation_text.strip()}\n\n"
 
     diff_section = ""
     if session_diff.strip():
-        diff_section = f"DIFF DELLA SESSIONE:\n{session_diff.strip()}\n\n"
+        diff_section = f"SESSION DIFF:\n{session_diff.strip()}\n\n"
 
     return (
-        "Sei un coding agent da terminale.\n"
-        "Ti passo i file attuali del progetto e poi una nuova richiesta.\n"
-        f"Obiettivo di questa passata: {objective}\n"
-        "Devi rispondere SOLO con il contenuto completo dei file modificati o nuovi, senza alcun testo aggiuntivo.\n\n"
-        "FORMATO OBBLIGATORIO:\n"
-        "===FILE: percorso/relativo===\n"
-        "contenuto completo del file\n"
+        "You are a terminal coding agent.\n"
+        "I will give you the current project files and then a new request.\n"
+        f"Goal for this pass: {objective}\n"
+        "You must reply ONLY with the complete contents of modified or new files, with no extra text.\n\n"
+        "MANDATORY FORMAT:\n"
+        "===FILE: relative/path===\n"
+        "full file contents\n"
         "===END===\n\n"
-        "REGOLE:\n"
-        "- aggiungi shebang se necessario\n"
-        "- nessuna spiegazione\n"
-        "- nessun commento introduttivo o finale\n"
-        "- nessun markdown\n"
-        "- nessun blocco ```\n"
-        "- restituisci solo i file modificati o nuovi\n"
-        "- usa solo percorsi relativi\n"
-        "- non toccare file interni di ollama-code\n"
-        "- non restituire file invariati\n"
-        "- chiudi sempre ogni blocco con una riga separata contenente esattamente ===END===\n"
-        "- se non serve modificare nulla, restituisci esattamente: NO_CHANGES\n\n"
+        "RULES:\n"
+        "- add a shebang when needed\n"
+        "- no explanation\n"
+        "- no intro or outro comments\n"
+        "- no markdown\n"
+        "- no ``` blocks\n"
+        "- return only modified or new files\n"
+        "- use only relative paths\n"
+        "- do not touch ollama-code internal files\n"
+        "- do not return unchanged files\n"
+        "- always close each block with a separate line containing exactly ===END===\n"
+        "- if nothing needs to change, return exactly: NO_CHANGES\n\n"
         f"{history_section}"
         f"{plan_section}"
         f"{review_section}"
         f"{validation_section}"
         f"{diff_section}"
-        "FILE ATTUALI DEL PROGETTO:\n\n"
+        "CURRENT PROJECT FILES:\n\n"
         f"{project_text}\n\n"
-        "NUOVA RICHIESTA:\n\n"
+        "NEW REQUEST:\n\n"
         f"{request}\n"
     )
 
@@ -1189,7 +1379,7 @@ def build_prompt(project_text: str, request: str, plan_text: str = "", request_h
     return build_code_prompt(
         project_text=project_text,
         request=request,
-        objective="realizza una prima implementazione completa e coerente con la richiesta",
+        objective="deliver a complete first implementation that matches the request",
         plan_text=plan_text,
         request_history=request_history,
     )
@@ -1205,74 +1395,74 @@ def build_review_prompt(
 ) -> str:
     plan_section = ""
     if plan_text.strip():
-        plan_section = f"PIANO PRECEDENTE:\n{plan_text.strip()}\n\n"
+        plan_section = f"PREVIOUS PLAN:\n{plan_text.strip()}\n\n"
 
     history_section = ""
     if request_history.strip():
-        history_section = f"STORIA RECENTE DELLE RICHIESTE:\n{request_history.strip()}\n\n"
+        history_section = f"RECENT REQUEST HISTORY:\n{request_history.strip()}\n\n"
 
     validation_section = ""
     if validation_text.strip():
-        validation_section = f"VALIDAZIONE RECENTE:\n{validation_text.strip()}\n\n"
+        validation_section = f"RECENT VALIDATION:\n{validation_text.strip()}\n\n"
 
     diff_section = ""
     if session_diff.strip():
-        diff_section = f"DIFF DELLA SESSIONE:\n{session_diff.strip()}\n\n"
+        diff_section = f"SESSION DIFF:\n{session_diff.strip()}\n\n"
 
     return (
-        "Sei un revisore tecnico severo.\n"
-        "Ti passo i file attuali del progetto dopo una prima implementazione, una richiesta utente, un piano, la validazione sintattica e il diff della sessione.\n"
-        "Devi trovare bug, regressioni, mancanze, incoerenze e punti deboli. Dai priorita assoluta agli errori di validazione.\n"
-        "Rispondi SOLO in testo semplice, senza markdown e senza blocchi ```.\n\n"
-        "FORMATO:\n"
-        "VERDETTO: OK oppure FIX\n"
-        "PROBLEMI:\n"
-        "- problema concreto\n"
-        "CORREZIONI:\n"
-        "- azione concreta\n"
-        "FILE:\n"
-        "- percorso/relativo\n\n"
-        "REGOLE:\n"
-        "- se non trovi problemi scrivi VERDETTO: OK\n"
-        "- se non c'e nulla da aggiungere usa '- nessuno'\n"
-        "- sii concreto, breve e severo\n"
-        "- non riscrivere i file\n"
-        "- nessun testo fuori dal formato richiesto\n\n"
+        "You are a strict technical reviewer.\n"
+        "I will give you the current project files after a first implementation, a user request, a plan, syntax validation output, and the session diff.\n"
+        "Find bugs, regressions, gaps, inconsistencies, and weak points. Give top priority to validation failures.\n"
+        "Reply ONLY in plain text, with no markdown and no ``` blocks.\n\n"
+        "FORMAT:\n"
+        "VERDICT: OK or FIX\n"
+        "ISSUES:\n"
+        "- concrete issue\n"
+        "FIXES:\n"
+        "- concrete action\n"
+        "FILES:\n"
+        "- relative/path\n\n"
+        "RULES:\n"
+        "- if you find no problems, write VERDICT: OK\n"
+        "- if there is nothing to add, use '- none'\n"
+        "- be concrete, brief, and strict\n"
+        "- do not rewrite files\n"
+        "- no text outside the required format\n\n"
         f"{history_section}"
         f"{plan_section}"
         f"{validation_section}"
         f"{diff_section}"
-        "FILE ATTUALI DEL PROGETTO:\n\n"
+        "CURRENT PROJECT FILES:\n\n"
         f"{project_text}\n\n"
-        "RICHIESTA UTENTE:\n\n"
+        "USER REQUEST:\n\n"
         f"{request}\n"
     )
 
 
 def build_change_summary_prompt(request: str, diff_text: str) -> str:
     return (
-        "Sei un assistente tecnico.\n"
-        "Ti passo una richiesta utente e il diff git reale delle modifiche.\n"
-        "Scrivi un riepilogo in italiano che spieghi cosa è stato fatto davvero.\n\n"
-        "REGOLE:\n"
-        "- usa solo ciò che si vede nel diff\n"
-        "- non inventare nulla\n"
-        "- spiega il risultato pratico delle modifiche\n"
-        "- cita file, funzioni o comportamenti solo se compaiono davvero\n"
-        "- rispondi SOLO in testo semplice\n"
-        "- niente markdown\n"
-        "- niente blocchi ```\n"
-        "- sii chiaro e abbastanza breve\n\n"
-        "FORMATO:\n"
-        "RIEPILOGO:\n"
-        "<paragrafo breve>\n\n"
-        "DETTAGLI:\n"
-        "- punto 1\n"
-        "- punto 2\n"
-        "- punto 3\n\n"
-        "RICHIESTA UTENTE:\n"
+        "You are a technical assistant.\n"
+        "I will give you a user request and the real git diff of the changes.\n"
+        "Write an English summary that explains what was actually done.\n\n"
+        "RULES:\n"
+        "- use only what is visible in the diff\n"
+        "- do not invent anything\n"
+        "- explain the practical result of the changes\n"
+        "- mention files, functions, or behaviors only if they really appear\n"
+        "- reply ONLY in plain text\n"
+        "- no markdown\n"
+        "- no ``` blocks\n"
+        "- be clear and fairly brief\n\n"
+        "FORMAT:\n"
+        "SUMMARY:\n"
+        "<short paragraph>\n\n"
+        "DETAILS:\n"
+        "- point 1\n"
+        "- point 2\n"
+        "- point 3\n\n"
+        "USER REQUEST:\n"
         f"{request}\n\n"
-        "DIFF GIT:\n"
+        "GIT DIFF:\n"
         f"{diff_text}\n"
     )
 
@@ -1371,7 +1561,7 @@ def should_retry_ollama(error_text: str) -> bool:
 
 
 class Spinner:
-    def __init__(self, label: str = "Attendo ollama", detail: str = ""):
+    def __init__(self, label: str = "Waiting for Ollama", detail: str = ""):
         self.label = label
         self.detail = detail
         self._stop = threading.Event()
@@ -1414,12 +1604,27 @@ def call_ollama(
     active_model = resolve_active_model(model, ollama_url)
     last_error = ""
     base_url = default_ollama_url(ollama_url)
+    headers = build_ollama_headers(base_url)
+
+    _SESSION_USAGE.last_resolved_model = normalize_model_value(active_model)
+    _SESSION_USAGE.last_target_was_cloud = is_cloud_target(active_model, ollama_url)
 
     if not active_model:
-        print(c("Errore eseguendo ollama.", RED), file=sys.stderr)
+        print(c("Error while running Ollama.", RED), file=sys.stderr)
         print(
             c(
-                "Nessun modello configurato o disponibile. Usa /model oppure imposta OLLAMA_MODEL.",
+                "No model configured or available. Use /model or set OLLAMA_MODEL.",
+                YELLOW,
+            ),
+            file=sys.stderr,
+        )
+        return ""
+
+    if is_ollama_cloud_url(base_url) and headers is None:
+        print(c("Error while running Ollama.", RED), file=sys.stderr)
+        print(
+            c(
+                "Direct requests to ollama.com require OLLAMA_API_KEY. Set it or use a local Ollama instance.",
                 YELLOW,
             ),
             file=sys.stderr,
@@ -1428,8 +1633,8 @@ def call_ollama(
 
     print(c(
         (
-            f"Eseguo Ollama su {base_url} con modello {active_model}. "
-            f"Prompt: {format_count(len(prompt))} caratteri."
+            f"Running Ollama on {base_url} with model {active_model}. "
+            f"Prompt: {format_count(len(prompt))} characters."
         ),
         MUTED,
     ))
@@ -1442,31 +1647,33 @@ def call_ollama(
 
     for attempt in range(1, OLLAMA_MAX_ATTEMPTS + 1):
         start = time.time()
-        print(c(f"Tentativo ollama {attempt}/{OLLAMA_MAX_ATTEMPTS}...", CYAN))
-        with Spinner("Interagisco con ollama", detail=f"tentativo {attempt}/{OLLAMA_MAX_ATTEMPTS}"):
+        print(c(f"Ollama attempt {attempt}/{OLLAMA_MAX_ATTEMPTS}...", CYAN))
+        with Spinner("Talking to Ollama", detail=f"attempt {attempt}/{OLLAMA_MAX_ATTEMPTS}"):
             data, error = request_json(
-                f"{base_url}/api/generate",
+                build_ollama_api_url(base_url, "/generate"),
                 payload=payload,
+                headers=headers,
                 timeout=OLLAMA_TIMEOUT_SECONDS,
             )
         elapsed = time.time() - start
-        print(c(f"Tempo ollama: {elapsed:.1f}s", MUTED))
+        print(c(f"Ollama time: {elapsed:.1f}s", MUTED))
 
         if error is None and isinstance(data, dict):
+            record_response_usage(data, active_model, ollama_url)
             raw = str(data.get("response") or "")
             cleaned = clean_plan_output(raw) if plan_mode else clean_ollama_output(raw)
             if cleaned.strip():
                 return cleaned
 
             response_error = str(data.get("error") or "").strip()
-            last_error = response_error or "Ollama ha restituito una risposta vuota."
+            last_error = response_error or "Ollama returned an empty response."
         else:
-            last_error = error or "Risposta non valida da Ollama."
+            last_error = error or "Invalid response from Ollama."
 
         print(c(
             (
-                "Ollama non ha restituito una risposta utile. "
-                f"Dettaglio: {preview_text(last_error, max_chars=240)}"
+                "Ollama did not return a usable response. "
+                f"Detail: {preview_text(last_error, max_chars=240)}"
             ),
             YELLOW,
         ))
@@ -1474,8 +1681,8 @@ def call_ollama(
         if attempt < OLLAMA_MAX_ATTEMPTS and should_retry_ollama(last_error):
             print(c(
                 (
-                    f"Tentativo ollama {attempt}/{OLLAMA_MAX_ATTEMPTS} fallito, "
-                    f"ritento tra {OLLAMA_RETRY_DELAY_SECONDS}s..."
+                    f"Ollama attempt {attempt}/{OLLAMA_MAX_ATTEMPTS} failed, "
+                    f"retrying in {OLLAMA_RETRY_DELAY_SECONDS}s..."
                 ),
                 YELLOW,
             ))
@@ -1484,12 +1691,12 @@ def call_ollama(
 
         break
 
-    print(c("Errore eseguendo ollama.", RED), file=sys.stderr)
+    print(c("Error while running Ollama.", RED), file=sys.stderr)
     lowered = last_error.lower()
     if "not found" in lowered or "model" in lowered and "not found" in lowered:
         print(
             c(
-                f"Modello Ollama non trovato: {active_model}. Usa /model oppure esegui `ollama pull {active_model}`.",
+                f"Ollama model not found: {active_model}. Use /model or run `ollama pull {active_model}`.",
                 YELLOW,
             ),
             file=sys.stderr,
@@ -1497,7 +1704,7 @@ def call_ollama(
     elif any(marker in lowered for marker in ("connection refused", "connect", "timeout")):
         print(
             c(
-                f"Ollama non risponde su {base_url}. Avvia `ollama serve` e riprova.",
+                f"Ollama is not responding on {base_url}. Start `ollama serve` and try again.",
                 YELLOW,
             ),
             file=sys.stderr,
@@ -1550,7 +1757,7 @@ def restore_files(root: Path, backup: dict[str, str | None]) -> None:
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_text(content, encoding="utf-8")
         except Exception as exc:
-            print(c(f"Impossibile ripristinare {rel}: {exc}", RED), file=sys.stderr)
+            print(c(f"Unable to restore {rel}: {exc}", RED), file=sys.stderr)
 
 
 def extend_backup(root: Path, backup: dict[str, str | None], rel_paths: list[str]) -> None:
@@ -1597,7 +1804,7 @@ def build_session_diff(root: Path, backup: dict[str, str | None], rel_paths: lis
 
     text = "\n\n".join(chunks).strip()
     if len(text) > MAX_SUMMARY_DIFF_CHARS:
-        text = text[:MAX_SUMMARY_DIFF_CHARS].rstrip() + "\n...[DIFF TRONCATO]...\n"
+        text = text[:MAX_SUMMARY_DIFF_CHARS].rstrip() + "\n...[DIFF TRUNCATED]...\n"
     return text
 
 
@@ -1673,7 +1880,7 @@ def tool_exists(name: str) -> bool:
 
 def validate_python(path: Path) -> tuple[bool, str]:
     if not tool_exists("python3"):
-        return False, "python3 non trovato nel sistema"
+        return False, "python3 not found on the system"
     cp = run(["python3", "-m", "py_compile", str(path)], check=False)
     output = (cp.stdout or "") + (cp.stderr or "")
     return cp.returncode == 0, output.strip()
@@ -1681,7 +1888,7 @@ def validate_python(path: Path) -> tuple[bool, str]:
 
 def validate_php(path: Path) -> tuple[bool, str]:
     if not tool_exists("php"):
-        return False, "php non trovato nel sistema"
+        return False, "php not found on the system"
     cp = run(["php", "-l", str(path)], check=False)
     output = (cp.stdout or "") + (cp.stderr or "")
     return cp.returncode == 0, output.strip()
@@ -1689,7 +1896,7 @@ def validate_php(path: Path) -> tuple[bool, str]:
 
 def validate_javascript(path: Path) -> tuple[bool, str]:
     if not tool_exists("node"):
-        return False, "node non trovato nel sistema"
+        return False, "node not found on the system"
     cp = run(["node", "--check", str(path)], check=False)
     output = (cp.stdout or "") + (cp.stderr or "")
     return cp.returncode == 0, output.strip()
@@ -1697,7 +1904,7 @@ def validate_javascript(path: Path) -> tuple[bool, str]:
 
 def validate_bash(path: Path) -> tuple[bool, str]:
     if not tool_exists("bash"):
-        return False, "bash non trovato nel sistema"
+        return False, "bash not found on the system"
     cp = run(["bash", "-n", str(path)], check=False)
     output = (cp.stdout or "") + (cp.stderr or "")
     return cp.returncode == 0, output.strip()
@@ -1740,8 +1947,8 @@ def validate_written_files(root: Path, written: list[str]) -> tuple[bool, list[s
         if ok:
             reports.append(f"{label}: OK")
         else:
-            failure_text = msg.strip() or "errore sconosciuto"
-            reports.append(f"{label}: ERRORE")
+            failure_text = msg.strip() or "unknown error"
+            reports.append(f"{label}: ERROR")
             failures.append(f"{label}\n{failure_text}")
 
     return len(failures) == 0, reports, failures
@@ -1752,22 +1959,22 @@ def show_validation_results(
     ok: bool,
     failures: list[str] | None = None,
 ) -> None:
-    print(c("\n--- VALIDAZIONE SINTATTICA ---\n", BOLD + BLUE))
+    print(c("\n--- SYNTAX VALIDATION ---\n", BOLD + BLUE))
 
     if reports:
         for row in reports:
             color = GREEN if row.endswith("OK") else RED
             print(c(row, color))
     else:
-        print(c("Nessun file validabile tra quelli modificati.", YELLOW))
+        print(c("No validatable files among the modified files.", YELLOW))
 
     print(c(
-        f"Validazione completata: {'OK' if ok else 'ERRORI'}",
+        f"Validation completed: {'OK' if ok else 'ERRORS'}",
         GREEN if ok else RED,
     ))
 
     if not ok and failures:
-        print(c("\n--- ERRORI DI VALIDAZIONE ---\n", BOLD + RED), file=sys.stderr)
+        print(c("\n--- VALIDATION ERRORS ---\n", BOLD + RED), file=sys.stderr)
         for err in failures:
             print(err, file=sys.stderr)
             print(file=sys.stderr)
@@ -1828,21 +2035,21 @@ def build_report(
         stats_cp = run(["git", "diff", "--cached", "--stat"], check=False)
         summary_cp = run(["git", "diff", "--cached", "--summary"], check=False)
 
-    pieces = [f"Richiesta: {request}"]
+    pieces = [f"Request: {request}"]
 
     if plan_text.strip():
-        pieces.append("Piano:\n" + plan_text.strip())
+        pieces.append("Plan:\n" + plan_text.strip())
 
     if visible_written:
-        pieces.append("File scritti: " + ", ".join(visible_written))
+        pieces.append("Files written: " + ", ".join(visible_written))
     else:
-        pieces.append("File scritti: nessuno")
+        pieces.append("Files written: none")
 
     if rejected:
-        pieces.append("Percorsi rifiutati: " + ", ".join(rejected))
+        pieces.append("Rejected paths: " + ", ".join(rejected))
 
     if validation_reports:
-        pieces.append("Validazione:\n" + "\n".join(validation_reports))
+        pieces.append("Validation:\n" + "\n".join(validation_reports))
 
     stat_text = stats_cp.stdout.strip()
     summary_text = summary_cp.stdout.strip()
@@ -1880,7 +2087,7 @@ def commit_written_files(written: list[str], request: str) -> bool:
 
     files = [f for f in written if f not in INTERNAL_STATE_FILES]
     if not has_staged_changes_for_files(written):
-        print(c("Niente da committare.", YELLOW))
+        print(c("Nothing to commit.", YELLOW))
         return False
 
     subject = build_commit_subject(request)
@@ -1892,9 +2099,9 @@ def commit_written_files(written: list[str], request: str) -> bool:
         print(cp.stderr, end="" if cp.stderr.endswith("\n") else "\n", file=sys.stderr)
 
     if cp.returncode == 0:
-        print(c("Commit completato.", GREEN))
+        print(c("Commit completed.", GREEN))
     else:
-        print(c("Commit fallito.", RED), file=sys.stderr)
+        print(c("Commit failed.", RED), file=sys.stderr)
 
     return cp.returncode == 0
 
@@ -1920,7 +2127,7 @@ def get_diff_text_for_summary(root: Path, written: list[str], use_last_commit: b
         return ""
 
     if len(text) > MAX_SUMMARY_DIFF_CHARS:
-        text = text[:MAX_SUMMARY_DIFF_CHARS].rstrip() + "\n...[DIFF TRONCATO]...\n"
+        text = text[:MAX_SUMMARY_DIFF_CHARS].rstrip() + "\n...[DIFF TRUNCATED]...\n"
 
     return text
 
@@ -1951,32 +2158,32 @@ def show_final_summary(
     summary_text: str = "",
 ) -> None:
     print()
-    print(c("=== RIEPILOGO FINALE DELLE MODIFICHE ===", BOLD + GREEN))
+    print(c("=== FINAL CHANGE SUMMARY ===", BOLD + GREEN))
 
     if summary_text.strip():
         print(summary_text.strip())
     else:
-        print(c("Nessun riepilogo testuale disponibile.", YELLOW))
+        print(c("No text summary available.", YELLOW))
 
     print()
-    print(c("Dettagli tecnici:", BOLD))
-    print(c(f"Richiesta: {request}", CYAN))
+    print(c("Technical details:", BOLD))
+    print(c(f"Request: {request}", CYAN))
 
     files = [f for f in written if f not in INTERNAL_STATE_FILES]
     if files:
-        print(c("File modificati:", BOLD))
+        print(c("Modified files:", BOLD))
         for f in files:
             print(f" - {f}")
     else:
-        print(c("File modificati: nessuno", YELLOW))
+        print(c("Modified files: none", YELLOW))
 
     if rejected:
-        print(c("Percorsi rifiutati:", YELLOW))
+        print(c("Rejected paths:", YELLOW))
         for f in rejected:
             print(f" - {f}")
 
     if validation_reports:
-        print(c("Validazione:", BOLD))
+        print(c("Validation:", BOLD))
         for row in validation_reports:
             color = GREEN if row.endswith("OK") else RED
             print(c(f" - {row}", color))
@@ -1991,7 +2198,7 @@ def show_final_summary(
         if commit_hash:
             print(c(f"Commit: {commit_hash}", GREEN))
         if commit_subject:
-            print(c(f"Messaggio: {commit_subject}", GREEN))
+            print(c(f"Commit message: {commit_subject}", GREEN))
 
 
 def save_last_response(root: Path, response: str) -> None:
@@ -2001,12 +2208,12 @@ def save_last_response(root: Path, response: str) -> None:
 def show_last_response(root: Path) -> None:
     p = first_existing_state_path(root, LAST_RESPONSE_FILE, LEGACY_LAST_RESPONSE_FILE)
     if not p.exists():
-        print(c("Nessuna ultima risposta salvata.", YELLOW))
+        print(c("No saved last response.", YELLOW))
         return
     try:
         text = p.read_text(encoding="utf-8")
     except Exception as exc:
-        print(c(f"Impossibile leggere {p.name}: {exc}", RED), file=sys.stderr)
+        print(c(f"Unable to read {p.name}: {exc}", RED), file=sys.stderr)
         return
     print(c(f"--- {p.name} ---\n", BOLD + BLUE))
     print(text.rstrip())
@@ -2035,27 +2242,27 @@ def parse_toggle_command(request: str, command: str, current: bool) -> bool | No
 
 
 def show_plan_status(enabled: bool) -> None:
-    state = "attiva" if enabled else "disattivata"
+    state = "enabled" if enabled else "disabled"
     color = GREEN if enabled else YELLOW
-    print(c(f"Pianificazione automatica {state}.", color))
+    print(c(f"Automatic planning {state}.", color))
 
 
 def show_dry_status(enabled: bool) -> None:
-    state = "attiva" if enabled else "disattivata"
+    state = "enabled" if enabled else "disabled"
     color = GREEN if enabled else YELLOW
     print(c(f"Dry-run {state}.", color))
 
 
 def show_commit_status(enabled: bool) -> None:
-    state = "attivo" if enabled else "disattivato"
+    state = "enabled" if enabled else "disabled"
     color = GREEN if enabled else YELLOW
-    print(c(f"Commit automatico {state}.", color))
+    print(c(f"Auto-commit {state}.", color))
 
 
 def show_engine_status(enabled: bool) -> None:
-    state = "attivo" if enabled else "disattivato"
+    state = "enabled" if enabled else "disabled"
     color = GREEN if enabled else YELLOW
-    print(c(f"Motore a 5 passi {state}.", color))
+    print(c(f"5-pass engine {state}.", color))
 
 
 def run_five_pass_code_step(
@@ -2071,36 +2278,36 @@ def run_five_pass_code_step(
     save_last_response(root, response)
 
     if response == "":
-        print(c("Errore: ollama non ha restituito una risposta valida.", RED))
-        print(c(f"La risposta completa è stata salvata in {LAST_RESPONSE_FILE}", MUTED))
+        print(c("Error: Ollama did not return a valid response.", RED))
+        print(c(f"The full response was saved to {LAST_RESPONSE_FILE}", MUTED))
         return AppliedPassResult(response=response, valid_response=False)
 
     result = apply_code_response(root, response, session_backup)
 
     if not result.valid_response:
         preview = response[:1000]
-        print(c("Errore: ollama non ha restituito blocchi file validi in questa passata.", RED))
-        print(c("Anteprima risposta:", YELLOW))
+        print(c("Error: Ollama did not return valid file blocks in this pass.", RED))
+        print(c("Response preview:", YELLOW))
         print(preview)
         print()
-        print(c(f"La risposta completa è stata salvata in {LAST_RESPONSE_FILE}", MUTED))
+        print(c(f"The full response was saved to {LAST_RESPONSE_FILE}", MUTED))
         return result
 
-    print(c(f"Risposta ollama ricevuta: {format_count(len(response))} caratteri.", MUTED))
-    print(c(f"Blocchi file trovati: {len(result.files_map)}", MUTED))
+    print(c(f"Ollama response received: {format_count(len(response))} characters.", MUTED))
+    print(c(f"File blocks found: {len(result.files_map)}", MUTED))
 
     if result.no_changes:
-        print(c("Nessuna nuova modifica proposta in questa passata.", YELLOW))
+        print(c("No new changes proposed in this pass.", YELLOW))
     else:
         print(c(
-            f"File scritti su disco: {len(result.written)}. Percorsi rifiutati: {len(result.rejected)}.",
+            f"Files written to disk: {len(result.written)}. Rejected paths: {len(result.rejected)}.",
             MUTED,
         ))
 
     if result.changed_files and not result.no_changes:
         show_written_files_diff(result.changed_files)
     elif not result.changed_files:
-        print(c("Nessuna modifica effettiva rilevata nella sessione.", YELLOW))
+        print(c("No effective changes detected in the session.", YELLOW))
 
     show_validation_results(
         reports=result.validation_reports,
@@ -2124,30 +2331,30 @@ def handle_request_single_pass(
     target_label = format_ollama_target(model, ollama_url)
 
     print()
-    print(c(f"Richiesta in lavorazione: {preview_text(request, max_chars=180)}", BOLD + CYAN))
-    print(c(f"Target attivo: {target_label}", MUTED))
-    print(c("\nLeggo i file del progetto...\n", CYAN))
+    print(c(f"Request in progress: {preview_text(request, max_chars=180)}", BOLD + CYAN))
+    print(c(f"Active target: {target_label}", MUTED))
+    print(c("\nReading project files...\n", CYAN))
     project_text, context_stats = collect_project_context(root)
     show_context_summary(context_stats)
 
     if request_history.strip():
         print(c(
-            f"Contesto richieste precedenti: {format_count(len(request_history))} caratteri.",
+            f"Previous request context: {format_count(len(request_history))} characters.",
             MUTED,
         ))
     else:
-        print(c("Contesto richieste precedenti: nessuno.", MUTED))
+        print(c("Previous request context: none.", MUTED))
 
     plan_text = ""
     if plan_mode_enabled:
-        print(c(f"Chiedo un piano a Ollama ({target_label})...\n", CYAN))
+        print(c(f"Requesting a plan from Ollama ({target_label})...\n", CYAN))
         plan_prompt = build_plan_prompt(project_text, request, request_history=request_history)
         plan_text = call_ollama(plan_prompt, ollama_url, model, plan_mode=True)
 
         if plan_text:
-            show_text_block("--- PIANO PROPOSTO ---", plan_text)
+            show_text_block("--- PROPOSED PLAN ---", plan_text)
         else:
-            print(c("Nessun piano disponibile, continuo comunque.\n", YELLOW))
+            print(c("No plan available, continuing anyway.\n", YELLOW))
 
     prompt = build_prompt(
         project_text,
@@ -2156,36 +2363,36 @@ def handle_request_single_pass(
         request_history=request_history,
     )
 
-    print(c(f"Invio a Ollama ({target_label})...\n", CYAN))
+    print(c(f"Sending to Ollama ({target_label})...\n", CYAN))
     response = call_ollama(prompt, ollama_url, model)
     save_last_response(root, response)
 
     if response == "":
-        print(c(f"Richiesta: {request}", BOLD))
+        print(c(f"Request: {request}", BOLD))
         print()
-        print(c("Errore: ollama non ha restituito una risposta valida.", RED))
+        print(c("Error: Ollama did not return a valid response.", RED))
         return
 
     if response.strip() == "NO_CHANGES":
-        print(c(f"Richiesta: {request}", BOLD))
+        print(c(f"Request: {request}", BOLD))
         print()
-        print(c("Nessuna modifica proposta.", YELLOW))
+        print(c("No changes proposed.", YELLOW))
         return
 
     files_map = parse_file_blocks(response)
-    print(c(f"Risposta ollama ricevuta: {format_count(len(response))} caratteri.", MUTED))
-    print(c(f"Blocchi file trovati: {len(files_map)}", MUTED))
+    print(c(f"Ollama response received: {format_count(len(response))} characters.", MUTED))
+    print(c(f"File blocks found: {len(files_map)}", MUTED))
 
     if not files_map:
         preview = response[:1000]
-        print(c(f"Richiesta: {request}", BOLD))
+        print(c(f"Request: {request}", BOLD))
         print()
-        print(c("Errore: ollama non ha restituito blocchi file validi.", RED))
+        print(c("Error: Ollama did not return valid file blocks.", RED))
         print()
-        print(c("Anteprima risposta:", YELLOW))
+        print(c("Response preview:", YELLOW))
         print(preview)
         print()
-        print(c(f"La risposta completa è stata salvata in {LAST_RESPONSE_FILE}", MUTED))
+        print(c(f"The full response was saved to {LAST_RESPONSE_FILE}", MUTED))
         return
 
     candidate_paths = [rel for rel in files_map if is_valid_relpath(rel)]
@@ -2193,20 +2400,20 @@ def handle_request_single_pass(
 
     written, rejected = write_files(root, files_map)
     print(c(
-        f"File scritti su disco: {len(written)}. Percorsi rifiutati: {len(rejected)}.",
+        f"Files written to disk: {len(written)}. Rejected paths: {len(rejected)}.",
         MUTED,
     ))
 
     if not written and not rejected:
-        print(c(f"Richiesta: {request}", BOLD))
+        print(c(f"Request: {request}", BOLD))
         print()
-        print(c("Nessuna modifica proposta.", YELLOW))
+        print(c("No changes proposed.", YELLOW))
         return
 
     if not has_any_changes_excluding_internal_files():
-        print(c(f"Richiesta: {request}", BOLD))
+        print(c(f"Request: {request}", BOLD))
         print()
-        print(c("File ricevuti ma nessuna modifica rilevata.", YELLOW))
+        print(c("Files were returned, but no effective changes were detected.", YELLOW))
         return
 
     show_written_files_diff(written)
@@ -2216,8 +2423,8 @@ def handle_request_single_pass(
     if not ok:
         restore_files(root, backup)
         git_reset_written_files(written)
-        print(c("Modifiche ripristinate automaticamente per errore di validazione.", RED))
-        print(c(f"La risposta completa è stata salvata in {LAST_RESPONSE_FILE}", MUTED))
+        print(c("Changes were automatically restored because validation failed.", RED))
+        print(c(f"The full response was saved to {LAST_RESPONSE_FILE}", MUTED))
         return
 
     report = build_report(
@@ -2242,7 +2449,7 @@ def handle_request_single_pass(
         )
         git_reset_written_files(written)
         restore_files(root, backup)
-        print(c("\nDry-run attivo: modifiche mostrate ma non salvate.", YELLOW))
+        print(c("\nDry-run enabled: changes were shown but not kept.", YELLOW))
         show_final_summary(
             root=root,
             request=request,
@@ -2282,7 +2489,7 @@ def handle_request_single_pass(
             use_last_commit=False,
             model=model,
         )
-        print(c("Commit automatico disattivato: modifiche lasciate nel working tree.", YELLOW))
+        print(c("Auto-commit disabled: changes were left in the working tree.", YELLOW))
         show_final_summary(
             root=root,
             request=request,
@@ -2308,30 +2515,30 @@ def handle_request_five_pass(
     target_label = format_ollama_target(model, ollama_url)
 
     print()
-    print(c(f"Richiesta in lavorazione: {preview_text(request, max_chars=180)}", BOLD + CYAN))
-    print(c(f"Target attivo: {target_label}", MUTED))
-    print(c("Modalita esecuzione: motore a 5 passi.", MUTED))
-    print(c("\nLeggo i file del progetto...\n", CYAN))
+    print(c(f"Request in progress: {preview_text(request, max_chars=180)}", BOLD + CYAN))
+    print(c(f"Active target: {target_label}", MUTED))
+    print(c("Execution mode: 5-pass engine.", MUTED))
+    print(c("\nReading project files...\n", CYAN))
     project_text, context_stats = collect_project_context(root)
     show_context_summary(context_stats)
 
     if request_history.strip():
         print(c(
-            f"Contesto richieste precedenti: {format_count(len(request_history))} caratteri.",
+            f"Previous request context: {format_count(len(request_history))} characters.",
             MUTED,
         ))
     else:
-        print(c("Contesto richieste precedenti: nessuno.", MUTED))
+        print(c("Previous request context: none.", MUTED))
 
-    print(c("\n--- MOTORE 5 PASSI: 1/5 PIANO ---\n", BOLD + BLUE))
+    print(c("\n--- 5-PASS ENGINE: 1/5 PLAN ---\n", BOLD + BLUE))
     plan_prompt = build_plan_prompt(project_text, request, request_history=request_history)
     plan_text = call_ollama(plan_prompt, ollama_url, model, plan_mode=True)
     save_last_response(root, plan_text)
 
     if plan_text:
-        show_text_block("Output del passo 1", plan_text)
+        show_text_block("Step 1 output", plan_text)
     else:
-        print(c("Nessun piano disponibile, continuo comunque.", YELLOW))
+        print(c("No plan available, continuing anyway.", YELLOW))
 
     session_backup: dict[str, str | None] = {}
     rejected_all: list[str] = []
@@ -2349,8 +2556,8 @@ def handle_request_five_pass(
         project_text=project_text,
         request=request,
         objective=(
-            "realizza una prima implementazione completa seguendo richiesta e piano; "
-            "preferisci modifiche semplici, robuste e valide sintatticamente"
+            "deliver a complete first implementation that follows the request and plan; "
+            "prefer simple, robust, syntactically valid changes"
         ),
         plan_text=plan_text,
         request_history=request_history,
@@ -2360,7 +2567,7 @@ def handle_request_five_pass(
         ollama_url=ollama_url,
         model=model,
         session_backup=session_backup,
-        step_title="--- MOTORE 5 PASSI: 2/5 BOZZA ---",
+        step_title="--- 5-PASS ENGINE: 2/5 DRAFT ---",
         prompt=draft_prompt,
     )
     rejected_all.extend(draft_result.rejected)
@@ -2369,7 +2576,7 @@ def handle_request_five_pass(
         last_valid_snapshot = backup_files(root, list(session_backup.keys()))
         last_valid_reports = draft_result.validation_reports[:]
         last_valid_failures = draft_result.validation_failures[:]
-        last_valid_label = "2/5 bozza"
+        last_valid_label = "2/5 draft"
 
     current_validation_ok = draft_result.validation_ok
     current_validation_reports = draft_result.validation_reports[:]
@@ -2377,11 +2584,11 @@ def handle_request_five_pass(
 
     if not draft_result.valid_response:
         restore_files(root, session_backup)
-        print(c("Il motore si ferma al passo 2 per risposta non valida.", RED))
+        print(c("The engine stops at step 2 because the response was invalid.", RED))
         return
 
     if not draft_result.changed_files:
-        print(c("Il motore non ha prodotto modifiche effettive.", YELLOW))
+        print(c("The engine did not produce effective changes.", YELLOW))
         return
 
     project_text, _ = collect_project_context(root)
@@ -2399,7 +2606,7 @@ def handle_request_five_pass(
         session_diff=session_diff,
     )
 
-    print(c("\n--- MOTORE 5 PASSI: 3/5 REVISIONE ---\n", BOLD + BLUE))
+    print(c("\n--- 5-PASS ENGINE: 3/5 REVIEW ---\n", BOLD + BLUE))
     review_text = call_ollama(review_prompt, ollama_url, model, plan_mode=True)
     save_last_response(root, review_text)
 
@@ -2408,15 +2615,15 @@ def handle_request_five_pass(
         print()
     else:
         review_text = (
-            "VERDETTO: FIX\n"
-            "PROBLEMI:\n"
-            "- revisione non disponibile\n"
-            "CORREZIONI:\n"
-            "- ricontrolla correttezza, completezza e validazione\n"
-            "FILE:\n"
-            "- nessuno"
+            "VERDICT: FIX\n"
+            "ISSUES:\n"
+            "- review unavailable\n"
+            "FIXES:\n"
+            "- recheck correctness, completeness, and validation\n"
+            "FILES:\n"
+            "- none"
         )
-        print(c("Revisione non disponibile, continuo con una passata correttiva prudente.", YELLOW))
+        print(c("Review unavailable, continuing with a conservative fix pass.", YELLOW))
 
     project_text, _ = collect_project_context(root)
     session_diff = build_session_diff(root, session_backup, compute_changed_files(root, session_backup))
@@ -2424,7 +2631,7 @@ def handle_request_five_pass(
         project_text=project_text,
         request=request,
         objective=(
-            "correggi i problemi emersi da revisione e validazione senza allargare inutilmente il perimetro"
+            "fix the issues found by review and validation without expanding scope unnecessarily"
         ),
         plan_text=plan_text,
         request_history=request_history,
@@ -2441,7 +2648,7 @@ def handle_request_five_pass(
         ollama_url=ollama_url,
         model=model,
         session_backup=session_backup,
-        step_title="--- MOTORE 5 PASSI: 4/5 CORREZIONI ---",
+        step_title="--- 5-PASS ENGINE: 4/5 FIXES ---",
         prompt=fix_prompt,
     )
     rejected_all.extend(fix_result.rejected)
@@ -2459,9 +2666,9 @@ def handle_request_five_pass(
             last_valid_snapshot = backup_files(root, list(session_backup.keys()))
             last_valid_reports = fix_result.validation_reports[:]
             last_valid_failures = fix_result.validation_failures[:]
-            last_valid_label = "4/5 correzioni"
+            last_valid_label = "4/5 fixes"
     else:
-        print(c("Passo 4 ignorato: mantengo lo stato corrente.", YELLOW))
+        print(c("Step 4 ignored: keeping the current state.", YELLOW))
 
     project_text, _ = collect_project_context(root)
     session_diff = build_session_diff(root, session_backup, compute_changed_files(root, session_backup))
@@ -2469,8 +2676,8 @@ def handle_request_five_pass(
         project_text=project_text,
         request=request,
         objective=(
-            "fai una rifinitura finale minima: robustezza, coerenza, nomi chiari e piccole mancanze residue; "
-            "se il codice e gia buono rispondi NO_CHANGES"
+            "do a minimal final polish: robustness, consistency, clear naming, and small remaining gaps; "
+            "if the code is already good, reply NO_CHANGES"
         ),
         plan_text=plan_text,
         request_history=request_history,
@@ -2487,7 +2694,7 @@ def handle_request_five_pass(
         ollama_url=ollama_url,
         model=model,
         session_backup=session_backup,
-        step_title="--- MOTORE 5 PASSI: 5/5 RIFINITURA ---",
+        step_title="--- 5-PASS ENGINE: 5/5 POLISH ---",
         prompt=polish_prompt,
     )
     rejected_all.extend(polish_result.rejected)
@@ -2505,15 +2712,15 @@ def handle_request_five_pass(
             last_valid_snapshot = backup_files(root, list(session_backup.keys()))
             last_valid_reports = polish_result.validation_reports[:]
             last_valid_failures = polish_result.validation_failures[:]
-            last_valid_label = "5/5 rifinitura"
+            last_valid_label = "5/5 polish"
     else:
-        print(c("Passo 5 ignorato: mantengo lo stato corrente.", YELLOW))
+        print(c("Step 5 ignored: keeping the current state.", YELLOW))
 
     final_changed = compute_changed_files(root, session_backup)
     rejected = unique_preserve(rejected_all)
 
     if not final_changed:
-        print(c("Il motore non ha prodotto modifiche effettive.", YELLOW))
+        print(c("The engine did not produce effective changes.", YELLOW))
         return
 
     final_ok, final_reports, final_failures = validate_written_files(root, final_changed)
@@ -2524,13 +2731,13 @@ def handle_request_five_pass(
             final_reports = last_valid_reports[:]
             final_failures = last_valid_failures[:]
             print(c(
-                f"Stato finale non valido: ripristino l'ultimo stato valido ({last_valid_label}).",
+                f"Final state is invalid: restoring the last valid state ({last_valid_label}).",
                 YELLOW,
             ))
         else:
             restore_files(root, session_backup)
-            print(c("Nessuno stato valido prodotto dal motore: modifiche ripristinate.", RED))
-            print(c(f"La risposta completa è stata salvata in {LAST_RESPONSE_FILE}", MUTED))
+            print(c("The engine did not produce any valid state: changes were restored.", RED))
+            print(c(f"The full response was saved to {LAST_RESPONSE_FILE}", MUTED))
             return
 
     report = build_report(
@@ -2555,7 +2762,7 @@ def handle_request_five_pass(
         )
         git_reset_written_files(final_changed)
         restore_files(root, session_backup)
-        print(c("\nDry-run attivo: modifiche mostrate ma non salvate.", YELLOW))
+        print(c("\nDry-run enabled: changes were shown but not kept.", YELLOW))
         show_final_summary(
             root=root,
             request=request,
@@ -2595,7 +2802,7 @@ def handle_request_five_pass(
             use_last_commit=False,
             model=model,
         )
-        print(c("Commit automatico disattivato: modifiche lasciate nel working tree.", YELLOW))
+        print(c("Auto-commit disabled: changes were left in the working tree.", YELLOW))
         show_final_summary(
             root=root,
             request=request,
@@ -2641,16 +2848,16 @@ def handle_request(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="ollama-code - coding agent da terminale")
+    parser = argparse.ArgumentParser(description="ollama-code - terminal coding agent")
     parser.add_argument(
         "--ollama-url",
         default=os.getenv("OLLAMA_HOST"),
-        help="Endpoint Ollama (default: OLLAMA_HOST oppure 127.0.0.1:11434)",
+        help="Ollama endpoint (default: OLLAMA_HOST or 127.0.0.1:11434)",
     )
-    parser.add_argument("--plan", action="store_true", default=DEFAULT_PLAN_MODE, help="Abilita piano automatico")
-    parser.add_argument("--dry-run", action="store_true", default=DEFAULT_DRY_RUN, help="Non salva modifiche finali")
-    parser.add_argument("--no-commit", action="store_true", help="Disabilita commit automatico")
-    parser.add_argument("--no-engine", action="store_true", help="Disabilita il motore a 5 passi")
+    parser.add_argument("--plan", action="store_true", default=DEFAULT_PLAN_MODE, help="Enable automatic planning")
+    parser.add_argument("--dry-run", action="store_true", default=DEFAULT_DRY_RUN, help="Do not keep final changes")
+    parser.add_argument("--no-commit", action="store_true", help="Disable automatic commit")
+    parser.add_argument("--no-engine", action="store_true", help="Disable the 5-pass engine")
     return parser.parse_args()
 
 
@@ -2662,6 +2869,8 @@ def main() -> None:
     auto_commit_enabled = not args.no_commit
     engine_enabled = DEFAULT_FIVE_PASS_ENGINE and not args.no_engine
     last_request = ""
+    global _SESSION_USAGE
+    _SESSION_USAGE = SessionUsageState()
 
     setup_readline()
 
@@ -2669,6 +2878,7 @@ def main() -> None:
     os.chdir(root)
     config = load_config(root)
     config["model"] = normalize_model_value(config.get("model"))
+    sync_session_usage_target(config["model"], ollama_url)
     request_completer = SlashCommandCompleter(config, ollama_url)
 
     show_ls(root)
@@ -2678,7 +2888,7 @@ def main() -> None:
     show_dry_status(dry_run_enabled)
     show_commit_status(auto_commit_enabled)
     show_engine_status(engine_enabled)
-    print(c("Comandi: /f  /s  /diff  /model [nome|numero|default]  /plan [on|off]  /dry [on|off]  /commit [on|off]  /engine [on|off]  /retry  /last  /history  /q", YELLOW) + "\n")
+    print(c("Commands: /f  /s  /diff  /model [name|number|default]  /plan [on|off]  /dry [on|off]  /commit [on|off]  /engine [on|off]  /retry  /last  /history  /q", YELLOW) + "\n")
 
     while True:
         try:
@@ -2715,7 +2925,7 @@ def main() -> None:
                     )
                     ok, next_model = resolve_model_choice(model_arg, models, allow_custom)
                     if not ok:
-                        print(c("Modello non valido. Usa /model per vedere le opzioni disponibili.", RED))
+                        print(c("Invalid model. Use /model to see the available options.", RED))
                         if note:
                             print(c(note, MUTED))
                         print()
@@ -2723,38 +2933,39 @@ def main() -> None:
 
                 config["model"] = next_model
                 save_config(root, config)
+                sync_session_usage_target(next_model, ollama_url)
                 show_model_status(next_model, ollama_url)
             elif request.startswith("/plan"):
                 next_value = parse_toggle_command(request, "/plan", plan_mode_enabled)
                 if next_value is None:
-                    print(c("Uso: /plan [on|off]", RED))
+                    print(c("Usage: /plan [on|off]", RED))
                 else:
                     plan_mode_enabled = next_value
                     show_plan_status(plan_mode_enabled)
             elif request.startswith("/dry"):
                 next_value = parse_toggle_command(request, "/dry", dry_run_enabled)
                 if next_value is None:
-                    print(c("Uso: /dry [on|off]", RED))
+                    print(c("Usage: /dry [on|off]", RED))
                 else:
                     dry_run_enabled = next_value
                     show_dry_status(dry_run_enabled)
             elif request.startswith("/commit"):
                 next_value = parse_toggle_command(request, "/commit", auto_commit_enabled)
                 if next_value is None:
-                    print(c("Uso: /commit [on|off]", RED))
+                    print(c("Usage: /commit [on|off]", RED))
                 else:
                     auto_commit_enabled = next_value
                     show_commit_status(auto_commit_enabled)
             elif request.startswith("/engine"):
                 next_value = parse_toggle_command(request, "/engine", engine_enabled)
                 if next_value is None:
-                    print(c("Uso: /engine [on|off]", RED))
+                    print(c("Usage: /engine [on|off]", RED))
                 else:
                     engine_enabled = next_value
                     show_engine_status(engine_enabled)
             elif request == "/retry":
                 if not last_request:
-                    print(c("Nessuna richiesta precedente da ripetere.", YELLOW))
+                    print(c("No previous request to repeat.", YELLOW))
                 else:
                     try:
                         handle_request(
@@ -2769,7 +2980,7 @@ def main() -> None:
                         )
                     except KeyboardInterrupt:
                         print()
-                        print(c("Richiesta interrotta.", YELLOW))
+                        print(c("Request interrupted.", YELLOW))
             elif request == "/last":
                 show_last_response(root)
             elif request == "/history":
@@ -2779,7 +2990,7 @@ def main() -> None:
             elif request.startswith("/s "):
                 run_shell_command(request[3:])
             else:
-                print(c("Comando sconosciuto.", RED))
+                print(c("Unknown command.", RED))
             print()
             continue
 
@@ -2797,10 +3008,10 @@ def main() -> None:
             )
         except KeyboardInterrupt:
             print()
-            print(c("Richiesta interrotta.", YELLOW))
+            print(c("Request interrupted.", YELLOW))
         print()
 
-    print(c("Uscita.", MUTED))
+    print(c("Exit.", MUTED))
 
 
 if __name__ == "__main__":

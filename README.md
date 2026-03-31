@@ -14,6 +14,8 @@ The project is intentionally simple: it is a single Python script designed for l
 - Supports dry-run mode to preview changes without keeping them.
 - Can automatically commit generated changes with Git.
 - Includes an optional multi-pass workflow with draft, review, fix, and polish steps.
+- Uses English as the default CLI and prompt language.
+- Shows cloud-model usage in the interactive prompt status bar when `prompt_toolkit` is available, using per-request compute-time metrics returned by Ollama.
 - Validates modified files before keeping changes:
   - Python via `python3 -m py_compile`
   - JavaScript via `node --check`
@@ -30,6 +32,7 @@ The project is intentionally simple: it is a single Python script designed for l
 Optional but recommended:
 
 - `prompt_toolkit` for a better interactive prompt and completions
+- `prompt_toolkit` is also required for the interactive cloud-usage status bar
 - `node` if you want JavaScript syntax validation
 - `php` if you want PHP syntax validation
 
@@ -125,6 +128,10 @@ Inside the prompt you can use:
 - `/last`: show the last saved raw response
 - `/history`: show recent request history
 - `/q`: quit
+
+When you are using an Ollama cloud model, the bottom status bar shows the latest cloud usage estimate and the running session total based on the usage durations returned by Ollama's API responses. This status bar is shown only in the richer `prompt_toolkit` prompt.
+
+If you point the tool directly at `https://ollama.com/api`, set `OLLAMA_API_KEY`. If you use a local Ollama instance on `localhost`, Ollama's own sign-in flow continues to work as usual for cloud models.
 
 ## How It Works
 
