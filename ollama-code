@@ -1555,7 +1555,7 @@ def build_change_summary_prompt(request: str, diff_text: str) -> str:
     )
 
 
-THINK_BLOCK_RE = re.compile(r"\s*", re.IGNORECASE | re.DOTALL)
+THINK_BLOCK_RE = re.compile(r"", re.IGNORECASE | re.DOTALL)
 
 
 def strip_thinking_sections(text: str) -> str:
@@ -1569,6 +1569,7 @@ def clean_ollama_output(text: str) -> str:
     cleaned = []
     for line in text.splitlines():
         s = line.strip().lower()
+        if s.startswith("thinking") or s.startswith("<think"):
             continue
         if s.startswith("warning:"):
             continue
@@ -1608,7 +1609,7 @@ def clean_plan_output(text: str) -> str:
     cleaned = []
     for line in text.splitlines():
         s = line.strip().lower()
-
+        if s.startswith("thinking") or s.startswith("<think"):
             continue
         if s.startswith("warning:"):
             continue
@@ -2023,63 +2024,64 @@ def validate_written_files(root: Path, written: list[str]) -> tuple[bool, list[s
         if rel in INTERNAL_STATE_FILES:
             continue
 
-        full = root / rel
-        kind, ok, msg = validate_file(full)
+        path = root / rel
+        kind, ok, msg = validate_file(path)
 
         if kind is None:
             continue
 
-        label = f"{rel} [{kind}]"
-        if ok:
-            reports.append(f"{label}: OK")
-        else:
-            failure_text = msg.strip() or "unknown error"
-            reports.append(f"{label}: ERROR")
-            failures.append(f"{label}\n{failure_text}")
+        report = f"{rel} ({kind}): {msg}"
+        reports.append(report)
+
+        if not ok:
+            failures.append(report)
 
     return len(failures) == 0, reports, failures
 
 
-def show_validation_results(
-    reports: list[str],
-    ok: bool,
-    failures: list[str] | None = None,
-) -> None:
-    print(c("\n--- SYNTAX VALIDATION ---\n", BOLD + BLUE))
-
-    if reports:
-        for row in reports:
-            color = GREEN if row.endswith("OK") else RED
-            print(c(row, color))
-    else:
-        print(c("No validatable files among the modified files.", YELLOW))
-
-    print(c(
-        f"Validation completed: {'OK' if ok else 'ERRORS'}",
-        GREEN if ok else RED,
-    ))
-
-    if not ok and failures:
-        print(c("\n--- VALIDATION ERRORS ---\n", BOLD + RED), file=sys.stderr)
-        for err in failures:
-            print(err, file=sys.stderr)
-            print(file=sys.stderr)
-
-
-def apply_code_response(
+def apply_pass(
     root: Path,
-    response: str,
-    session_backup: dict[str, str | None],
+    project_text: str,
+    request: str,
+    ollama_url: str,
+    model: str | None,
+    plan_text: str = "",
+    request_history: str = "",
+    review_text: str = "",
+    validation_text: str = "",
+    session_diff: str = "",
+    backup: dict[str, str | None] | None = None,
 ) -> AppliedPassResult:
-    result = AppliedPassResult(response=response)
+    objective = "deliver a complete first implementation that matches the request"
+    if review_text.strip():
+        objective = "fix the issues identified in the review"
+    elif validation_text.strip() and "ERRORS" in validation_text:
+        objective = "fix the syntax errors and validation failures"
+
+    prompt = build_code_prompt(
+        project_text=project_text,
+        request=request,
+        objective=objective,
+        plan_text=plan_text,
+        request_history=request_history,
+        review_text=review_text,
+        validation_text=validation_text,
+        session_diff=session_diff,
+    )
+
+    response = call_ollama(prompt, ollama_url, model, plan_mode=False)
+
+    result = AppliedPassResult(
+        response=response,
+        valid_response=bool(response.strip()),
+    )
+
+    if not response.strip():
+        result.no_changes = True
+        return result
 
     if response.strip() == "NO_CHANGES":
         result.no_changes = True
-        result.changed_files = compute_changed_files(root, session_backup)
-        ok, reports, failures = validate_written_files(root, result.changed_files)
-        result.validation_ok = ok
-        result.validation_reports = reports
-        result.validation_failures = failures
         return result
 
     files_map = parse_file_blocks(response)
@@ -2089,81 +2091,190 @@ def apply_code_response(
         result.valid_response = False
         return result
 
-    candidate_paths = [rel for rel in files_map if is_valid_relpath(rel)]
-    extend_backup(root, session_backup, candidate_paths)
+    rel_paths = list(files_map.keys())
+
+    if backup is not None:
+        extend_backup(root, backup, rel_paths)
 
     written, rejected = write_files(root, files_map)
     result.written = written
     result.rejected = rejected
-    result.changed_files = compute_changed_files(root, session_backup)
 
-    ok, reports, failures = validate_written_files(root, result.changed_files)
-    result.validation_ok = ok
-    result.validation_reports = reports
-    result.validation_failures = failures
+    if written:
+        changed = compute_changed_files(root, backup or {})
+        result.changed_files = changed
+
+        valid, reports, failures = validate_written_files(root, written)
+        result.validation_ok = valid
+        result.validation_reports = reports
+        result.validation_failures = failures
+
+        if not valid:
+            print(c("\n❌ Validation failed. Rolling back changes.", RED))
+            for failure in failures:
+                print(c(f"  - {failure}", YELLOW))
+            if backup is not None:
+                restore_files(root, backup)
+            else:
+                restore_files(root, backup_files(root, written))
+
     return result
 
 
-def build_report(
+def run_five_pass_engine(
+    root: Path,
+    project_text: str,
     request: str,
-    written: list[str],
-    rejected: list[str],
-    validation_ok: bool,
-    validation_failures: list[str],
-    dry_run: bool,
-) -> str:
-    lines: list[str] = []
+    ollama_url: str,
+    model: str | None,
+    request_history: str = "",
+) -> tuple[bool, list[str]]:
+    print(c("\n🔄 Starting five-pass engine...", BOLD + CYAN))
 
-    lines.append(c("✨ REQUEST COMPLETED ✨", BOLD + MAGENTA))
-    lines.append("")
+    backup: dict[str, str | None] = {}
+    all_written: list[str] = []
 
-    if written:
-        lines.append(c(f"Files written: {len(written)}", GREEN))
-        for f in written:
-            lines.append(f"  + {f}")
-    else:
-        lines.append(c("No files were modified.", YELLOW))
+    plan_result = apply_pass(
+        root=root,
+        project_text=project_text,
+        request=request,
+        ollama_url=ollama_url,
+        model=model,
+        request_history=request_history,
+        backup=backup,
+    )
 
-    if rejected:
-        lines.append("")
-        lines.append(c(f"Files rejected: {len(rejected)}", RED))
-        for f in rejected:
-            lines.append(f"  - {f}")
+    plan_text = ""
+    if plan_result.valid_response and plan_result.response.strip():
+        plan_prompt = build_plan_prompt(project_text, request, request_history)
+        plan_text = call_ollama(plan_prompt, ollama_url, model, plan_mode=True)
+        plan_text = clean_plan_output(plan_text)
+        print(c("\n📋 Plan generated.", GREEN))
 
-    if validation_failures:
-        lines.append("")
-        lines.append(c("Validation failures:", RED))
-        for f in validation_failures:
-            lines.append(f"  ! {f}")
+    draft_result = apply_pass(
+        root=root,
+        project_text=project_text,
+        request=request,
+        ollama_url=ollama_url,
+        model=model,
+        plan_text=plan_text,
+        request_history=request_history,
+        backup=backup,
+    )
 
-    if dry_run:
-        lines.append("")
-        lines.append(c("⚠️  DRY RUN - changes will be reverted", YELLOW))
+    all_written.extend(draft_result.written)
 
-    return "\n".join(lines)
+    if not draft_result.valid_response or draft_result.no_changes:
+        print(c("\n⚠️ Draft pass did not produce changes.", YELLOW))
+        return draft_result.validation_ok, unique_preserve(all_written)
+
+    review_project_text, _ = collect_project_context(root)
+
+    session_diff = build_session_diff(root, backup, draft_result.written)
+
+    validation_text = ""
+    if draft_result.validation_reports or draft_result.validation_failures:
+        validation_text = build_validation_feedback(
+            draft_result.validation_ok,
+            draft_result.validation_reports,
+            draft_result.validation_failures,
+        )
+
+    review_prompt = build_review_prompt(
+        project_text=review_project_text,
+        request=request,
+        plan_text=plan_text,
+        request_history=request_history,
+        validation_text=validation_text,
+        session_diff=session_diff,
+    )
+
+    review_text = call_ollama(review_prompt, ollama_url, model, plan_mode=False)
+    review_text = clean_ollama_output(review_text)
+
+    print(c("\n🔍 Review completed.", GREEN))
+
+    fix_result = apply_pass(
+        root=root,
+        project_text=review_project_text,
+        request=request,
+        ollama_url=ollama_url,
+        model=model,
+        plan_text=plan_text,
+        request_history=request_history,
+        review_text=review_text,
+        validation_text=validation_text,
+        session_diff=session_diff,
+        backup=backup,
+    )
+
+    all_written.extend(fix_result.written)
+
+    polish_project_text, _ = collect_project_context(root)
+    polish_session_diff = build_session_diff(root, backup, unique_preserve(all_written))
+
+    polish_result = apply_pass(
+        root=root,
+        project_text=polish_project_text,
+        request=request,
+        ollama_url=ollama_url,
+        model=model,
+        plan_text=plan_text,
+        request_history=request_history,
+        session_diff=polish_session_diff,
+        backup=backup,
+    )
+
+    all_written.extend(polish_result.written)
+
+    print(c("\n✅ Five-pass engine completed.", GREEN))
+
+    return polish_result.validation_ok, unique_preserve(all_written)
 
 
-def create_commit_message(root: Path, request: str, written: list[str]) -> str:
-    cp = run(["git", "diff", "--cached"], check=False)
-    diff_text = cp.stdout.strip()
+def make_commit_message(root: Path, request: str, written: list[str]) -> str:
+    if not written:
+        return "ollama-code: no changes"
 
-    if not diff_text:
-        return request
+    diff_text = ""
+    cp = run(["git", "diff", "--", *written], check=False)
+    if cp.stdout:
+        diff_text = cp.stdout
 
-    prompt = build_change_summary_prompt(request, diff_text)
-    summary = call_ollama(prompt, default_ollama_url(), None, plan_mode=False)
+    if len(diff_text) > MAX_SUMMARY_DIFF_CHARS:
+        diff_text = diff_text[:MAX_SUMMARY_DIFF_CHARS].rstrip() + "\n...[DIFF TRUNCATED]...\n"
+
+    summary_prompt = build_change_summary_prompt(request, diff_text)
+    summary = call_ollama(summary_prompt, default_ollama_url(), None, plan_mode=False)
 
     if summary.strip():
         lines = summary.strip().splitlines()
-        first_line = lines[0].replace("SUMMARY:", "").strip() if lines else request
-        return first_line[:72]
+        first_line = lines[0].strip()
+        if first_line.startswith("SUMMARY:"):
+            first_line = first_line[len("SUMMARY:"):].strip()
+        if len(first_line) > 72:
+            first_line = first_line[:69] + "..."
+        body_lines = []
+        for line in lines[1:]:
+            s = line.strip()
+            if s.startswith("DETAILS:"):
+                continue
+            if s.startswith("-"):
+                body_lines.append(s)
+        if body_lines:
+            return first_line + "\n\n" + "\n".join(body_lines)
+        return first_line
 
-    return request[:72]
+    short_request = preview_text(request, max_chars=60)
+    return f"ollama-code: {short_request}"
 
 
-def commit_changes(root: Path, request: str, written: list[str]) -> bool:
+def create_commit(root: Path, request: str, written: list[str]) -> bool:
     files = [f for f in written if f not in INTERNAL_STATE_FILES]
     if not files:
+        return False
+
+    if not has_any_changes_excluding_internal_files():
         return False
 
     git_add_written_files(written)
@@ -2171,172 +2282,21 @@ def commit_changes(root: Path, request: str, written: list[str]) -> bool:
     if not has_staged_changes():
         return False
 
-    message = create_commit_message(root, request, written)
-
+    message = make_commit_message(root, request, written)
     cp = run(["git", "commit", "-m", message], check=False)
+
     if cp.returncode == 0:
-        print(c(f"Committed: {message}", GREEN))
+        print(c(f"\n✅ Commit created: {preview_text(message, max_chars=80)}", GREEN))
         return True
     else:
-        print(c("Git commit failed.", RED), file=sys.stderr)
+        print(c("\n⚠️ Commit failed.", YELLOW))
         if cp.stderr:
             print(cp.stderr, file=sys.stderr)
+        git_reset_written_files(written)
         return False
 
 
-def run_five_pass_engine(
-    root: Path,
-    request: str,
-    project_text: str,
-    ollama_url: str,
-    model: str | None,
-    request_history: str,
-    dry_run: bool,
-    auto_commit: bool,
-) -> None:
-    print(c("\n🎯 FIVE-PASS ENGINE ACTIVATED", BOLD + MAGENTA))
-    print(c("─" * 60, DIM))
-
-    session_backup: dict[str, str | None] = {}
-
-    print(c("\n[1/5] PLANNING", BOLD + CYAN))
-    plan_prompt = build_plan_prompt(project_text, request, request_history)
-    plan_response = call_ollama(plan_prompt, ollama_url, model, plan_mode=True)
-
-    if not plan_response.strip():
-        print(c("Planning failed. Aborting.", RED), file=sys.stderr)
-        return
-
-    print(c("\nPlan:", GREEN))
-    print(plan_response)
-
-    print(c("\n[2/5] DRAFTING", BOLD + CYAN))
-    draft_prompt = build_code_prompt(
-        project_text=project_text,
-        request=request,
-        objective="create a first draft implementation",
-        plan_text=plan_response,
-        request_history=request_history,
-    )
-    draft_response = call_ollama(draft_prompt, ollama_url, model, plan_mode=False)
-
-    draft_result = apply_code_response(root, draft_response, session_backup)
-
-    if not draft_result.valid_response:
-        print(c("Draft response invalid. Aborting.", RED), file=sys.stderr)
-        if dry_run:
-            restore_files(root, session_backup)
-        return
-
-    print(c("\n[3/5] REVIEWING", BOLD + CYAN))
-    review_project_text, _ = collect_project_context(root)
-    session_diff = build_session_diff(root, session_backup, draft_result.changed_files)
-    validation_text = build_validation_feedback(
-        draft_result.validation_ok,
-        draft_result.validation_reports,
-        draft_result.validation_failures,
-    )
-
-    review_prompt = build_review_prompt(
-        project_text=review_project_text,
-        request=request,
-        plan_text=plan_response,
-        request_history=request_history,
-        validation_text=validation_text,
-        session_diff=session_diff,
-    )
-    review_response = call_ollama(review_prompt, ollama_url, model, plan_mode=False)
-
-    print(c("\nReview:", GREEN))
-    print(review_response)
-
-    needs_fix = "VERDICT: FIX" in review_response.upper()
-
-    if needs_fix:
-        print(c("\n[4/5] FIXING", BOLD + CYAN))
-        fix_prompt = build_code_prompt(
-            project_text=review_project_text,
-            request=request,
-            objective="fix the issues identified in the review",
-            plan_text=plan_response,
-            request_history=request_history,
-            review_text=review_response,
-            validation_text=validation_text,
-            session_diff=session_diff,
-        )
-        fix_response = call_ollama(fix_prompt, ollama_url, model, plan_mode=False)
-
-        fix_result = apply_code_response(root, fix_response, session_backup)
-
-        if fix_result.valid_response:
-            print(c("\n[5/5] POLISHING", BOLD + CYAN))
-            polish_project_text, _ = collect_project_context(root)
-            polish_diff = build_session_diff(root, session_backup, fix_result.changed_files)
-
-            polish_prompt = build_code_prompt(
-                project_text=polish_project_text,
-                request=request,
-                objective="polish and finalize the implementation",
-                plan_text=plan_response,
-                request_history=request_history,
-                review_text=review_response,
-                validation_text=validation_text,
-                session_diff=polish_diff,
-            )
-            polish_response = call_ollama(polish_prompt, ollama_url, model, plan_mode=False)
-
-            apply_code_response(root, polish_response, session_backup)
-    else:
-        print(c("\n[4/5] SKIPPED (no fixes needed)", BOLD + CYAN))
-        print(c("\n[5/5] POLISHING", BOLD + CYAN))
-        polish_project_text, _ = collect_project_context(root)
-        polish_diff = build_session_diff(root, session_backup, draft_result.changed_files)
-
-        polish_prompt = build_code_prompt(
-            project_text=polish_project_text,
-            request=request,
-            objective="polish and finalize the implementation",
-            plan_text=plan_response,
-            request_history=request_history,
-            review_text=review_response,
-            validation_text=validation_text,
-            session_diff=polish_diff,
-        )
-        polish_response = call_ollama(polish_prompt, ollama_url, model, plan_mode=False)
-
-        apply_code_response(root, polish_response, session_backup)
-
-    final_changed = compute_changed_files(root, session_backup)
-
-    if final_changed:
-        print(c("\n" + "═" * 60, BOLD + MAGENTA))
-        print(c("FINAL CHANGES", BOLD + WHITE))
-        print(c("═" * 60, BOLD + MAGENTA))
-
-        for rel in final_changed:
-            before = session_backup.get(rel)
-            after = read_text_snapshot(root / rel)
-            show_colored_file_diff(before, after, rel)
-
-        print(c("═" * 60, BOLD + MAGENTA))
-
-    show_validation_results(
-        draft_result.validation_reports + (fix_result.validation_reports if needs_fix else []),
-        draft_result.validation_ok and (fix_result.validation_ok if needs_fix else True),
-        draft_result.validation_failures + (fix_result.validation_failures if needs_fix else []),
-    )
-
-    if dry_run:
-        print(c("\n🔄 Restoring original files (dry run)...", YELLOW))
-        restore_files(root, session_backup)
-    else:
-        if auto_commit:
-            commit_changes(root, request, final_changed)
-
-    print(c("\n✅ Five-pass engine completed!", GREEN))
-
-
-def handle_request(
+def process_request(
     root: Path,
     request: str,
     ollama_url: str,
@@ -2345,185 +2305,153 @@ def handle_request(
     dry_run: bool,
     auto_commit: bool,
     five_pass_engine: bool,
-) -> None:
-    print(c("\n📚 Collecting project context...", CYAN))
+) -> bool:
     project_text, stats = collect_project_context(root)
     show_context_summary(stats)
 
     request_history = build_request_history_context(root)
+    append_request_history(root, request)
+
+    backup: dict[str, str | None] = {}
+    written: list[str] = []
+    validation_ok = True
 
     if five_pass_engine:
-        run_five_pass_engine(
+        validation_ok, written = run_five_pass_engine(
             root=root,
-            request=request,
             project_text=project_text,
+            request=request,
             ollama_url=ollama_url,
             model=model,
             request_history=request_history,
-            dry_run=dry_run,
-            auto_commit=auto_commit,
         )
-        return
-
-    session_backup: dict[str, str | None] = {}
-
-    if plan_mode:
-        print(c("\n📋 Generating plan...", CYAN))
-        plan_prompt = build_plan_prompt(project_text, request, request_history)
-        plan_response = call_ollama(plan_prompt, ollama_url, model, plan_mode=True)
-
-        if plan_response.strip():
-            print(c("\nPlan:", GREEN))
-            print(plan_response)
-        else:
-            print(c("Plan generation failed.", RED), file=sys.stderr)
-
-    print(c("\n🤖 Generating code...", CYAN))
-    code_prompt = build_prompt(project_text, request, plan_response if plan_mode else "", request_history)
-    response = call_ollama(code_prompt, ollama_url, model, plan_mode=False)
-
-    if not response.strip():
-        print(c("No response from Ollama.", RED), file=sys.stderr)
-        return
-
-    result = apply_code_response(root, response, session_backup)
-
-    if not result.valid_response:
-        print(c("Invalid response format from Ollama.", RED), file=sys.stderr)
-        if dry_run:
-            restore_files(root, session_backup)
-        return
-
-    if result.no_changes:
-        print(c("\nNo changes needed.", YELLOW))
     else:
-        print(c("\n" + "═" * 60, BOLD + MAGENTA))
-        print(c("CHANGES PREVIEW", BOLD + WHITE))
-        print(c("═" * 60, BOLD + MAGENTA))
-
-        for rel in result.changed_files:
-            before = session_backup.get(rel)
-            after = read_text_snapshot(root / rel)
-            show_colored_file_diff(before, after, rel)
-
-        print(c("═" * 60, BOLD + MAGENTA))
-
-    show_validation_results(
-        result.validation_reports,
-        result.validation_ok,
-        result.validation_failures,
-    )
-
-    if not result.validation_ok:
-        print(c("\n⚠️  Validation failed. Restoring original files...", YELLOW))
-        restore_files(root, session_backup)
-        return
+        result = apply_pass(
+            root=root,
+            project_text=project_text,
+            request=request,
+            ollama_url=ollama_url,
+            model=model,
+            plan_text="" if not plan_mode else call_ollama(
+                build_plan_prompt(project_text, request, request_history),
+                ollama_url,
+                model,
+                plan_mode=True,
+            ),
+            request_history=request_history,
+            backup=backup,
+        )
+        written = result.written
+        validation_ok = result.validation_ok
 
     if dry_run:
-        print(c("\n🔄 Restoring original files (dry run)...", YELLOW))
-        restore_files(root, session_backup)
+        print(c("\n🧪 DRY RUN MODE - Restoring original files...", YELLOW))
+        restore_files(root, backup)
+        print(c("Original files restored.", GREEN))
     else:
-        if auto_commit and result.changed_files:
-            commit_changes(root, request, result.changed_files)
+        if written:
+            print(c(f"\n✨ Wrote {len(written)} file(s):", GREEN))
+            for f in written:
+                print(f"  - {f}")
 
-    print(build_report(
-        request=request,
-        written=result.written,
-        rejected=result.rejected,
-        validation_ok=result.validation_ok,
-        validation_failures=result.validation_failures,
-        dry_run=dry_run,
-    ))
+            if validation_ok:
+                print(c("\n✅ All validations passed.", GREEN))
+            else:
+                print(c("\n❌ Some validations failed. Changes were rolled back.", RED))
+
+            if auto_commit and validation_ok and written:
+                create_commit(root, request, written)
+
+    if DEFAULT_SHOW_DIFF and not dry_run and written:
+        show_written_files_diff(written, backup, root)
+
+    return validation_ok
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="ollama-code: Terminal coding agent powered by Ollama",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Terminal coding agent powered by local Ollama models"
     )
     parser.add_argument(
         "--ollama-url",
+        dest="ollama_url",
+        default=None,
         help="Custom Ollama endpoint (default: OLLAMA_HOST or http://127.0.0.1:11434)",
     )
     parser.add_argument(
         "--plan",
+        dest="plan_mode",
         action="store_true",
+        default=DEFAULT_PLAN_MODE,
         help="Ask Ollama for a plan before generating code",
     )
     parser.add_argument(
         "--dry-run",
+        dest="dry_run",
         action="store_true",
+        default=DEFAULT_DRY_RUN,
         help="Show changes but restore the working tree afterward",
     )
     parser.add_argument(
         "--no-commit",
-        action="store_true",
+        dest="auto_commit",
+        action="store_false",
+        default=DEFAULT_AUTO_COMMIT,
         help="Disable automatic Git commits",
     )
     parser.add_argument(
         "--no-engine",
-        action="store_true",
+        dest="five_pass_engine",
+        action="store_false",
+        default=DEFAULT_FIVE_PASS_ENGINE,
         help="Disable the five-pass engine",
     )
 
     args = parser.parse_args()
 
-    setup_readline()
-
+    ollama_url = args.ollama_url or default_ollama_url()
     root = ensure_git_repo()
 
+    setup_readline()
+
     config = load_config(root)
-
-    ollama_url = args.ollama_url or default_ollama_url()
     model = config.get("model")
-    plan_mode = args.plan or DEFAULT_PLAN_MODE
-    dry_run = args.dry_run or DEFAULT_DRY_RUN
-    auto_commit = not args.no_commit and DEFAULT_AUTO_COMMIT
-    five_pass_engine = not args.no_engine and DEFAULT_FIVE_PASS_ENGINE
 
-    print(c("\n👋 Welcome to ollama-code!", BOLD + GREEN))
-    print(c("Your AI pair programmer for the terminal.", MUTED))
-    print(c(f"Model: {format_model_name(model)}", CYAN))
-    print(c(f"Ollama: {ollama_url}", CYAN))
-    if PYGMENTS_AVAILABLE:
-        print(c("Syntax highlighting: enabled ✨", GREEN))
-    else:
-        print(c("Syntax highlighting: disabled (install pygments for colors)", YELLOW))
+    plan_mode = args.plan_mode
+    dry_run = args.dry_run
+    auto_commit = args.auto_commit
+    five_pass_engine = args.five_pass_engine
+
+    print(c("Welcome to ollama-code!", BOLD + GREEN))
+    print(c(f"Working directory: {root}", MUTED))
+    print(c(f"Ollama endpoint: {ollama_url}", MUTED))
+    show_model_status(model, ollama_url)
     print()
 
     completer = SlashCommandCompleter(config, ollama_url)
 
-    last_request = ""
-
     while True:
         try:
-            user_input = prompt_input("ollama-code> ", CYAN, completer)
+            request = prompt_input("ollama-code> ", CYAN, completer=completer).strip()
         except (EOFError, KeyboardInterrupt):
-            print("\n")
+            print()
             break
 
-        user_input = user_input.strip()
-        if not user_input:
+        if not request:
             continue
 
-        if user_input.startswith("/"):
-            parts = user_input.split()
+        if request.startswith("/"):
+            parts = request.split(None, 1)
             command = parts[0].lower()
-            arg = " ".join(parts[1:]) if len(parts) > 1 else None
+            arg = parts[1] if len(parts) > 1 else ""
 
             if command == "/f":
                 list_files(root)
-                continue
-
-            if command == "/s":
-                run_shell_command(arg)
-                continue
-
-            if command == "/diff":
+            elif command == "/s":
+                run_shell_command(arg if arg else None)
+            elif command == "/diff":
                 show_git_diff()
-                continue
-
-            if command == "/model":
+            elif command == "/model":
                 if arg:
                     ok, selected = resolve_model_choice(
                         arg,
@@ -2534,10 +2462,7 @@ def main() -> None:
                         model = selected
                         config["model"] = model
                         save_config(root, config)
-                        if model:
-                            print(c(f"Model set to: {model}", GREEN))
-                        else:
-                            print(c("Model reset to automatic", GREEN))
+                        print(c(f"Model set to: {format_model_name(model)}", GREEN))
                     else:
                         print(c("Invalid model.", RED))
                 else:
@@ -2549,44 +2474,53 @@ def main() -> None:
                         if model:
                             print(c(f"Model set to: {model}", GREEN))
                         else:
-                            print(c("Model reset to automatic", GREEN))
-                continue
-
-            if command == "/plan":
-                if arg and arg.lower() in {"on", "off"}:
-                    plan_mode = arg.lower() == "on"
+                            print(c("Model reset to automatic.", GREEN))
+            elif command == "/plan":
+                if arg.lower() == "on":
+                    plan_mode = True
+                    print(c("Planning mode: ON", GREEN))
+                elif arg.lower() == "off":
+                    plan_mode = False
+                    print(c("Planning mode: OFF", GREEN))
                 else:
                     plan_mode = not plan_mode
-                print(c(f"Plan mode: {'ON' if plan_mode else 'OFF'}", GREEN))
-                continue
-
-            if command == "/dry":
-                if arg and arg.lower() in {"on", "off"}:
-                    dry_run = arg.lower() == "on"
+                    print(c(f"Planning mode: {'ON' if plan_mode else 'OFF'}", GREEN))
+            elif command == "/dry":
+                if arg.lower() == "on":
+                    dry_run = True
+                    print(c("Dry-run mode: ON", GREEN))
+                elif arg.lower() == "off":
+                    dry_run = False
+                    print(c("Dry-run mode: OFF", GREEN))
                 else:
                     dry_run = not dry_run
-                print(c(f"Dry run: {'ON' if dry_run else 'OFF'}", GREEN))
-                continue
-
-            if command == "/commit":
-                if arg and arg.lower() in {"on", "off"}:
-                    auto_commit = arg.lower() == "on"
+                    print(c(f"Dry-run mode: {'ON' if dry_run else 'OFF'}", GREEN))
+            elif command == "/commit":
+                if arg.lower() == "on":
+                    auto_commit = True
+                    print(c("Auto-commit: ON", GREEN))
+                elif arg.lower() == "off":
+                    auto_commit = False
+                    print(c("Auto-commit: OFF", GREEN))
                 else:
                     auto_commit = not auto_commit
-                print(c(f"Auto commit: {'ON' if auto_commit else 'OFF'}", GREEN))
-                continue
-
-            if command == "/engine":
-                if arg and arg.lower() in {"on", "off"}:
-                    five_pass_engine = arg.lower() == "on"
+                    print(c(f"Auto-commit: {'ON' if auto_commit else 'OFF'}", GREEN))
+            elif command == "/engine":
+                if arg.lower() == "on":
+                    five_pass_engine = True
+                    print(c("Five-pass engine: ON", GREEN))
+                elif arg.lower() == "off":
+                    five_pass_engine = False
+                    print(c("Five-pass engine: OFF", GREEN))
                 else:
                     five_pass_engine = not five_pass_engine
-                print(c(f"Five-pass engine: {'ON' if five_pass_engine else 'OFF'}", GREEN))
-                continue
-
-            if command == "/retry":
-                if last_request:
-                    handle_request(
+                    print(c(f"Five-pass engine: {'ON' if five_pass_engine else 'OFF'}", GREEN))
+            elif command == "/retry":
+                entries = parse_request_history_entries(root)
+                if entries:
+                    _, last_request = entries[-1]
+                    print(c(f"Retrying: {preview_text(last_request)}", CYAN))
+                    process_request(
                         root=root,
                         request=last_request,
                         ollama_url=ollama_url,
@@ -2598,36 +2532,26 @@ def main() -> None:
                     )
                 else:
                     print(c("No previous request to retry.", YELLOW))
-                continue
-
-            if command == "/last":
+            elif command == "/last":
                 p = first_existing_state_path(root, LAST_RESPONSE_FILE, LEGACY_LAST_RESPONSE_FILE)
                 if p.exists():
-                    content = p.read_text(encoding="utf-8")
-                    print(c("--- Last Response ---\n", BOLD + BLUE))
-                    print(content)
+                    print(c(f"--- {p.name} ---\n", BOLD + BLUE))
+                    print(p.read_text(encoding="utf-8"))
                 else:
                     print(c("No saved response.", YELLOW))
-                continue
-
-            if command == "/history":
+            elif command == "/history":
                 show_request_history(root)
-                continue
-
-            if command == "/q":
-                print(c("Goodbye! 👋", GREEN))
+            elif command == "/q":
+                print(c("Goodbye!", GREEN))
                 break
-
-            print(c(f"Unknown command: {command}", RED))
-            print(c("Type /q to quit or just ask me to code something!", MUTED))
+            else:
+                print(c(f"Unknown command: {command}", YELLOW))
+                print(c("Type /q to quit or see available commands.", MUTED))
             continue
 
-        last_request = user_input
-        append_request_history(root, user_input)
-
-        handle_request(
+        process_request(
             root=root,
-            request=user_input,
+            request=request,
             ollama_url=ollama_url,
             model=model,
             plan_mode=plan_mode,
@@ -2635,9 +2559,6 @@ def main() -> None:
             auto_commit=auto_commit,
             five_pass_engine=five_pass_engine,
         )
-
-        p = root / LAST_RESPONSE_FILE
-        p.write_text(last_request, encoding="utf-8")
 
 
 if __name__ == "__main__":
