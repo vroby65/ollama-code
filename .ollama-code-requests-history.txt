@@ -1,0 +1,42 @@
+TIME: 2026-04-03 20:42:50
+TEXT:
+implementa in ollama-code la sintassi colorata del codice. Fai un output che comprende sempre le differenze tra il codice precedente e quello attuato crea un prompt simpatico
+
+===END_REQUEST===
+TIME: 2026-04-03 20:51:27
+TEXT:
+verifica il codice e risolvi i problemi
+
+===END_REQUEST===
+TIME: 2026-04-03 20:56:32
+TEXT:
+Traceback (most recent call last):
+  File "/home/user/sviluppo/Progetti/ollama-code (DEV)/./ollama-code", line 2565, in <module>
+    main()
+  File "/home/user/sviluppo/Progetti/ollama-code (DEV)/./ollama-code", line 2552, in main
+    process_request(
+  File "/home/user/sviluppo/Progetti/ollama-code (DEV)/./ollama-code", line 2309, in process_request
+    project_text, stats = collect_project_context(root)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/sviluppo/Progetti/ollama-code (DEV)/./ollama-code", line 725, in collect_project_context
+    stats.truncated_files.append(rel)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'dict' object has no attribute 'append'
+
+===END_REQUEST===
+TIME: 2026-04-03 21:10:31
+TEXT:
+Traceback (most recent call last):
+  File "/home/user/sviluppo/Progetti/ollama-code (DEV)/./ollama-code", line 2565, in <module>
+    main()
+  File "/home/user/sviluppo/Progetti/ollama-code (DEV)/./ollama-code", line 2552, in main
+    process_request(
+  File "/home/user/sviluppo/Progetti/ollama-code (DEV)/./ollama-code", line 2309, in process_request
+    project_text, stats = collect_project_context(root)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/sviluppo/Progetti/ollama-code (DEV)/./ollama-code", line 725, in collect_project_context
+    stats.truncated_files.append(rel)
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'dict' object has no attribute 'append'
+
+===END_REQUEST===

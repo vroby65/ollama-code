@@ -48,6 +48,8 @@ MAX_HISTORY_SUMMARY_ITEMS = 12
 MAX_SUMMARY_ITEM_CHARS = 140
 MAX_SUMMARY_DIFF_CHARS = 50000
 MODEL_DISCOVERY_TIMEOUT_SECONDS = 10
+TEST_RUN_TIMEOUT_SECONDS = 300
+MAX_TEST_OUTPUT_CHARS = 12000
 
 USER_CONFIG_FILE = ".ollama-code"
 LEGACY_USER_CONFIG_FILE = ".tider"
@@ -57,6 +59,8 @@ LEGACY_LAST_RESPONSE_FILE = ".tider-last-response.txt"
 REQUEST_HISTORY_FILE = ".ollama-code-requests-history.txt"
 LEGACY_REQUEST_HISTORY_FILE = ".tider-requests-history.txt"
 REQUEST_SEPARATOR = "\n===END_REQUEST===\n"
+GENERATED_README_START = "<!-- OLLAMA-CODE:GENERATED-INSTRUCTIONS START -->"
+GENERATED_README_END = "<!-- OLLAMA-CODE:GENERATED-INSTRUCTIONS END -->"
 
 OLLAMA_MAX_ATTEMPTS = 3
 OLLAMA_RETRY_DELAY_SECONDS = 2
@@ -67,6 +71,7 @@ DEFAULT_PLAN_MODE = False
 DEFAULT_DRY_RUN = False
 DEFAULT_AUTO_COMMIT = True
 DEFAULT_FIVE_PASS_ENGINE = False
+DEFAULT_AUTO_README = True
 DEFAULT_SHOW_DIFF = True
 
 RESET = "\033[0m"
@@ -113,6 +118,7 @@ SLASH_COMMANDS = [
     "/dry",
     "/commit",
     "/engine",
+    "/readme",
     "/retry",
     "/last",
     "/history",
@@ -128,13 +134,14 @@ SLASH_COMMAND_DESCRIPTIONS = {
     "/dry": "toggle dry-run",
     "/commit": "toggle commit",
     "/engine": "toggle 5-pass engine",
+    "/readme": "toggle readme instructions",
     "/retry": "repeat last request",
     "/last": "show last response",
     "/history": "show recent requests",
     "/q": "quit",
 }
 
-SLASH_TOGGLE_COMMANDS = {"/plan", "/dry", "/commit", "/engine"}
+SLASH_TOGGLE_COMMANDS = {"/plan", "/dry", "/commit", "/engine", "/readme"}
 READLINE_HISTORY_FILE = os.path.expanduser("~/.ollama_code_history")
 
 _PROMPT_SESSION = None
@@ -189,7 +196,7 @@ class ProjectContextStats:
     included_files: list[str] = field(default_factory=list)
     skipped_counts: dict[str, int] = field(default_factory=dict)
     skipped_examples: dict[str, list[str]] = field(default_factory=dict)
-    truncated_files: list[str] = field(default_factory=dict)
+    truncated_files: list[str] = field(default_factory=list)
     total_chars: int = 0
     context_truncated: bool = False
 
@@ -204,6 +211,8 @@ class AppliedPassResult:
     validation_ok: bool = True
     validation_reports: list[str] = field(default_factory=list)
     validation_failures: list[str] = field(default_factory=list)
+    test_reports: list[str] = field(default_factory=list)
+    test_failures: list[str] = field(default_factory=list)
     no_changes: bool = False
     valid_response: bool = True
 
@@ -1359,22 +1368,20 @@ def build_plan_prompt(project_text: str, request: str, request_history: str = ""
         history_section = f"RECENT REQUEST HISTORY:\n{request_history.strip()}\n\n"
 
     return (
-        "👋 Hey there, code wizard! Let's plan this together!\n\n"
-        "You are a terminal coding agent.\n"
-        "I will give you the current project files and then a new request.\n"
-        "Before changing code, you must produce an execution plan.\n"
-        "Reply ONLY in plain text, with no markdown and no ``` blocks.\n\n"
+        "Role: terminal coding agent.\n"
+        "Task: produce an execution plan before changing code.\n"
+        "Reply only in plain text.\n\n"
         "FORMAT:\n"
         "PLAN:\n"
         "- objective\n"
         "- files to modify\n"
         "- expected changes\n"
         "- risks\n"
-        "- suggested syntax checks\n\n"
+        "- validation and tests\n\n"
         "RULES:\n"
-        "- no final explanation\n"
-        "- no text outside the plan\n"
-        "- be concrete and brief\n\n"
+        "- be concrete and brief\n"
+        "- no markdown\n"
+        "- no text outside the required format\n\n"
         f"{history_section}"
         "CURRENT PROJECT FILES:\n\n"
         f"{project_text}\n\n"
@@ -1387,15 +1394,24 @@ def build_validation_feedback(
     ok: bool,
     reports: list[str],
     failures: list[str],
+    test_reports: list[str] | None = None,
+    test_failures: list[str] | None = None,
 ) -> str:
-    if not reports and not failures:
-        return "RESULT: no validatable files"
+    test_reports = test_reports or []
+    test_failures = test_failures or []
+
+    if not reports and not failures and not test_reports and not test_failures:
+        return "RESULT: no syntax validation or tests executed"
 
     parts = [f"RESULT: {'OK' if ok else 'ERRORS'}"]
     if reports:
-        parts.append("REPORT:\n" + "\n".join(reports))
+        parts.append("SYNTAX REPORT:\n" + "\n".join(reports))
     if failures:
-        parts.append("ERRORS:\n" + "\n\n".join(failures))
+        parts.append("SYNTAX ERRORS:\n" + "\n\n".join(failures))
+    if test_reports:
+        parts.append("TEST REPORT:\n" + "\n".join(test_reports))
+    if test_failures:
+        parts.append("TEST ERRORS:\n" + "\n\n".join(test_failures))
     return "\n\n".join(parts).strip()
 
 
@@ -1430,17 +1446,18 @@ def build_code_prompt(
         diff_section = f"SESSION DIFF:\n{session_diff.strip()}\n\n"
 
     return (
-        "🚀 Alright, let's code! Here's what we're doing:\n\n"
-        f"Goal for this pass: {objective}\n"
-        "You must reply ONLY with the complete contents of modified or new files, with no extra text.\n\n"
+        "Role: terminal coding agent.\n"
+        f"Pass objective: {objective}\n"
+        "Reply only with complete contents of modified or new files.\n\n"
         "MANDATORY FORMAT:\n"
         "===FILE: relative/path===\n"
         "full file contents\n"
         "===END===\n\n"
         "RULES:\n"
+        "- keep responses coherent and deterministic\n"
+        "- preserve existing behavior unless the request requires changes\n"
         "- add a shebang when needed\n"
-        "- no explanation\n"
-        "- no intro or outro comments\n"
+        "- no explanation text\n"
         "- no markdown\n"
         "- no ``` blocks\n"
         "- return only modified or new files\n"
@@ -1496,11 +1513,10 @@ def build_review_prompt(
         diff_section = f"SESSION DIFF:\n{session_diff.strip()}\n\n"
 
     return (
-        "🔍 Time for a code review! Be strict but fair.\n\n"
-        "You are a strict technical reviewer.\n"
-        "I will give you the current project files after a first implementation, a user request, a plan, syntax validation output, and the session diff.\n"
-        "Find bugs, regressions, gaps, inconsistencies, and weak points. Give top priority to validation failures.\n"
-        "Reply ONLY in plain text, with no markdown and no ``` blocks.\n\n"
+        "Role: strict technical reviewer.\n"
+        "Task: review current project files against request, plan, validation/test output, and diff.\n"
+        "Prioritize concrete failures and risky behavior regressions.\n"
+        "Reply only in plain text.\n\n"
         "FORMAT:\n"
         "VERDICT: OK or FIX\n"
         "ISSUES:\n"
@@ -1514,6 +1530,7 @@ def build_review_prompt(
         "- if there is nothing to add, use '- none'\n"
         "- be concrete, brief, and strict\n"
         "- do not rewrite files\n"
+        "- no markdown\n"
         "- no text outside the required format\n\n"
         f"{history_section}"
         f"{plan_section}"
@@ -1555,7 +1572,10 @@ def build_change_summary_prompt(request: str, diff_text: str) -> str:
     )
 
 
-THINK_BLOCK_RE = re.compile(r"", re.IGNORECASE | re.DOTALL)
+THINK_BLOCK_RE = re.compile(
+    r"<\s*(?:think|thinking)\b[^>]*>.*?<\s*/\s*(?:think|thinking)\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def strip_thinking_sections(text: str) -> str:
@@ -1566,37 +1586,45 @@ def clean_ollama_output(text: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = strip_thinking_sections(text)
 
-    cleaned = []
-    for line in text.splitlines():
-        s = line.strip().lower()
-        if s.startswith("thinking") or s.startswith("<think"):
+    lines = text.splitlines()
+    while lines:
+        marker = lines[0].strip().lower()
+        if marker.startswith("warning:") or marker.startswith("thinking") or marker.startswith("<think"):
+            lines.pop(0)
             continue
-        if s.startswith("warning:"):
+        if marker in {"```", "```text", "```markdown"}:
+            lines.pop(0)
             continue
-        if s in {""}:
-            continue
-        cleaned.append(line)
+        break
 
-    text = "\n".join(cleaned).strip()
+    while lines:
+        marker = lines[-1].strip().lower()
+        if marker in {"```"}:
+            lines.pop()
+            continue
+        break
+
+    text = "\n".join(lines).strip()
 
     if text.startswith("```text"):
-        text = text[len("```text"):].lstrip()
+        text = text[len("```text"):].lstrip("\n")
     elif text.startswith("```markdown"):
-        text = text[len("```markdown"):].lstrip()
+        text = text[len("```markdown"):].lstrip("\n")
     elif text.startswith("```"):
-        text = text[3:].lstrip()
+        text = text[3:].lstrip("\n")
 
     if text.endswith("```"):
-        text = text[:-3].rstrip()
+        text = text[:-3].rstrip("\n")
 
-    if text.strip() == "NO_CHANGES":
+    stripped = text.strip()
+    if stripped == "NO_CHANGES":
         return "NO_CHANGES"
 
     pos = text.find("===FILE:")
     if pos != -1:
         text = text[pos:]
 
-    stripped = text.strip()
+    stripped = text.strip("\n")
     if not stripped:
         return ""
     return stripped + "\n"
@@ -2039,6 +2067,211 @@ def validate_written_files(root: Path, written: list[str]) -> tuple[bool, list[s
     return len(failures) == 0, reports, failures
 
 
+def has_python_tests(root: Path) -> bool:
+    if (root / "tests").is_dir():
+        return True
+    if any(root.glob("test_*.py")) or any(root.glob("*_test.py")):
+        return True
+
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            content = pyproject.read_text(encoding="utf-8")
+            if "[tool.pytest" in content:
+                return True
+        except Exception:
+            pass
+
+    return (root / "pytest.ini").exists()
+
+
+def python_module_available(module_name: str) -> bool:
+    if not tool_exists("python3"):
+        return False
+
+    cp = run(["python3", "-c", f"import {module_name}"], check=False)
+    return cp.returncode == 0
+
+
+def default_python_test_command(root: Path) -> str:
+    if (root / "tests").is_dir():
+        return "python3 -m unittest discover -s tests -p 'test_*.py' -q"
+    return "python3 -m unittest discover -s . -p 'test_*.py' -q"
+
+
+def detect_test_command(root: Path) -> tuple[str | None, str | None]:
+    explicit = os.getenv("OLLAMA_CODE_TEST_COMMAND", "").strip()
+    if explicit:
+        return explicit, None
+
+    if has_python_tests(root):
+        if tool_exists("python3"):
+            if python_module_available("pytest"):
+                return "python3 -m pytest -q", None
+            return default_python_test_command(root), None
+        return None, "Python tests detected but python3 is not available."
+
+    package_json = root / "package.json"
+    if package_json.exists():
+        for command in ("pnpm test", "npm test", "yarn test"):
+            if tool_exists(command.split()[0]):
+                return command, None
+        return None, "package.json found but npm/pnpm/yarn is not available."
+
+    return None, None
+
+
+def truncate_validation_output(text: str, max_chars: int = MAX_TEST_OUTPUT_CHARS) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    head = max_chars // 2
+    tail = max(1, max_chars - head - len("\n...[OUTPUT TRUNCATED]...\n"))
+    return (
+        cleaned[:head].rstrip()
+        + "\n...[OUTPUT TRUNCATED]...\n"
+        + cleaned[-tail:].lstrip()
+    )
+
+
+def run_project_tests(root: Path) -> tuple[bool, list[str], list[str]]:
+    command, reason = detect_test_command(root)
+
+    if command is None:
+        if reason:
+            return False, [f"tests: {reason}"], [f"tests: {reason}"]
+        return True, [], []
+
+    try:
+        cp = run(
+            command,
+            shell=True,
+            check=False,
+            timeout=TEST_RUN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        timeout_msg = (
+            f"tests ({command}) timed out after {TEST_RUN_TIMEOUT_SECONDS}s"
+        )
+        return False, [timeout_msg], [timeout_msg]
+
+    output = ((cp.stdout or "") + ("\n" if cp.stdout and cp.stderr else "") + (cp.stderr or ""))
+    output = truncate_validation_output(output)
+
+    status = "ok" if cp.returncode == 0 else f"failed (exit {cp.returncode})"
+    report_lines = [f"tests ({command}): {status}"]
+    if output:
+        report_lines.append(output)
+    report = "\n".join(report_lines).strip()
+
+    if cp.returncode == 0:
+        return True, [report], []
+    return False, [report], [report]
+
+
+def build_generated_readme_instructions(
+    request: str,
+    changed_files: list[str],
+    test_command: str | None,
+) -> str:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    files = unique_preserve([f for f in changed_files if f not in INTERNAL_STATE_FILES])
+    if not files:
+        files = ["(no file changes detected)"]
+
+    lines = [
+        "## Generated Code Instructions",
+        "",
+        f"- Generated at: `{timestamp}`",
+        f"- Original request: `{preview_text(request, max_chars=220)}`",
+        "",
+        "### Changed Files",
+    ]
+    lines.extend(f"- `{path}`" for path in files)
+
+    lines.extend(
+        [
+            "",
+            "### Validation And Test Flow",
+            "- Syntax checks run automatically based on file type.",
+            "- If checks fail, changes are rolled back and a corrective pass is executed.",
+        ]
+    )
+
+    if test_command:
+        lines.append(f"- Test command detected: `{test_command}`")
+    else:
+        lines.append("- Test command detected: none (configure `OLLAMA_CODE_TEST_COMMAND` if needed).")
+
+    lines.extend(
+        [
+            "",
+            "### Suggested Review Checklist",
+            "1. Review the changed files listed above.",
+            "2. Run the detected test command and verify expected behavior.",
+            "3. Confirm edge cases and error handling for modified paths.",
+        ]
+    )
+
+    return "\n".join(lines).rstrip()
+
+
+def upsert_generated_readme_section(existing_readme: str, section_text: str) -> str:
+    block = (
+        f"{GENERATED_README_START}\n"
+        f"{section_text.rstrip()}\n"
+        f"{GENERATED_README_END}"
+    )
+
+    existing = existing_readme.rstrip()
+    pattern = re.compile(
+        re.escape(GENERATED_README_START) + r".*?" + re.escape(GENERATED_README_END),
+        re.DOTALL,
+    )
+
+    if existing and pattern.search(existing):
+        updated = pattern.sub(block, existing)
+        return updated.rstrip() + "\n"
+
+    if existing:
+        return existing + "\n\n" + block + "\n"
+
+    return "# README\n\n" + block + "\n"
+
+
+def generate_readme_instructions_for_changes(
+    root: Path,
+    request: str,
+    changed_files: list[str],
+    backup: dict[str, str | None] | None = None,
+) -> tuple[bool, str | None]:
+    files = unique_preserve([f for f in changed_files if f not in INTERNAL_STATE_FILES])
+    if not files:
+        return False, None
+
+    readme_rel = "README.md"
+    readme_path = root / readme_rel
+    existing_readme = read_text_snapshot(readme_path) or ""
+    test_command, _ = detect_test_command(root)
+    instructions = build_generated_readme_instructions(
+        request=request,
+        changed_files=files,
+        test_command=test_command,
+    )
+    updated_readme = upsert_generated_readme_section(existing_readme, instructions)
+
+    if updated_readme == existing_readme:
+        return False, None
+
+    if backup is not None:
+        extend_backup(root, backup, [readme_rel])
+
+    readme_path.write_text(updated_readme, encoding="utf-8")
+    print(c("README.md updated with generated code instructions.", CYAN))
+    return True, readme_rel
+
+
 def apply_pass(
     root: Path,
     project_text: str,
@@ -2092,7 +2325,7 @@ def apply_pass(
         return result
 
     rel_paths = list(files_map.keys())
-
+    restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
     if backup is not None:
         extend_backup(root, backup, rel_paths)
 
@@ -2101,22 +2334,33 @@ def apply_pass(
     result.rejected = rejected
 
     if written:
-        changed = compute_changed_files(root, backup or {})
+        changed = compute_changed_files(root, restore_snapshot)
         result.changed_files = changed
+        if not changed and not rejected:
+            result.no_changes = True
 
-        valid, reports, failures = validate_written_files(root, written)
-        result.validation_ok = valid
+        valid, reports, failures = validate_written_files(root, changed or written)
         result.validation_reports = reports
         result.validation_failures = failures
 
-        if not valid:
-            print(c("\n❌ Validation failed. Rolling back changes.", RED))
+        tests_ok = True
+        test_reports: list[str] = []
+        test_failures: list[str] = []
+        if valid and changed:
+            tests_ok, test_reports, test_failures = run_project_tests(root)
+
+        result.test_reports = test_reports
+        result.test_failures = test_failures
+        result.validation_ok = valid and tests_ok
+
+        if not result.validation_ok:
+            print(c("\n❌ Validation/tests failed. Rolling back changes.", RED))
             for failure in failures:
                 print(c(f"  - {failure}", YELLOW))
-            if backup is not None:
-                restore_files(root, backup)
-            else:
-                restore_files(root, backup_files(root, written))
+            for failure in test_failures:
+                print(c(f"  - {preview_text(failure, max_chars=300)}", YELLOW))
+            restore_files(root, restore_snapshot)
+            result.changed_files = compute_changed_files(root, restore_snapshot)
 
     return result
 
@@ -2128,27 +2372,18 @@ def run_five_pass_engine(
     ollama_url: str,
     model: str | None,
     request_history: str = "",
+    backup: dict[str, str | None] | None = None,
 ) -> tuple[bool, list[str]]:
     print(c("\n🔄 Starting five-pass engine...", BOLD + CYAN))
 
-    backup: dict[str, str | None] = {}
+    backup_map = backup if backup is not None else {}
     all_written: list[str] = []
 
-    plan_result = apply_pass(
-        root=root,
-        project_text=project_text,
-        request=request,
-        ollama_url=ollama_url,
-        model=model,
-        request_history=request_history,
-        backup=backup,
-    )
-
     plan_text = ""
-    if plan_result.valid_response and plan_result.response.strip():
-        plan_prompt = build_plan_prompt(project_text, request, request_history)
-        plan_text = call_ollama(plan_prompt, ollama_url, model, plan_mode=True)
-        plan_text = clean_plan_output(plan_text)
+    plan_prompt = build_plan_prompt(project_text, request, request_history)
+    plan_text = call_ollama(plan_prompt, ollama_url, model, plan_mode=True)
+    plan_text = clean_plan_output(plan_text)
+    if plan_text:
         print(c("\n📋 Plan generated.", GREEN))
 
     draft_result = apply_pass(
@@ -2159,10 +2394,10 @@ def run_five_pass_engine(
         model=model,
         plan_text=plan_text,
         request_history=request_history,
-        backup=backup,
+        backup=backup_map,
     )
 
-    all_written.extend(draft_result.written)
+    all_written.extend(draft_result.changed_files)
 
     if not draft_result.valid_response or draft_result.no_changes:
         print(c("\n⚠️ Draft pass did not produce changes.", YELLOW))
@@ -2170,14 +2405,21 @@ def run_five_pass_engine(
 
     review_project_text, _ = collect_project_context(root)
 
-    session_diff = build_session_diff(root, backup, draft_result.written)
+    session_diff = build_session_diff(root, backup_map, draft_result.changed_files)
 
     validation_text = ""
-    if draft_result.validation_reports or draft_result.validation_failures:
+    if (
+        draft_result.validation_reports
+        or draft_result.validation_failures
+        or draft_result.test_reports
+        or draft_result.test_failures
+    ):
         validation_text = build_validation_feedback(
             draft_result.validation_ok,
             draft_result.validation_reports,
             draft_result.validation_failures,
+            test_reports=draft_result.test_reports,
+            test_failures=draft_result.test_failures,
         )
 
     review_prompt = build_review_prompt(
@@ -2190,7 +2432,7 @@ def run_five_pass_engine(
     )
 
     review_text = call_ollama(review_prompt, ollama_url, model, plan_mode=False)
-    review_text = clean_ollama_output(review_text)
+    review_text = clean_plan_output(review_text)
 
     print(c("\n🔍 Review completed.", GREEN))
 
@@ -2205,13 +2447,13 @@ def run_five_pass_engine(
         review_text=review_text,
         validation_text=validation_text,
         session_diff=session_diff,
-        backup=backup,
+        backup=backup_map,
     )
 
-    all_written.extend(fix_result.written)
+    all_written.extend(fix_result.changed_files)
 
     polish_project_text, _ = collect_project_context(root)
-    polish_session_diff = build_session_diff(root, backup, unique_preserve(all_written))
+    polish_session_diff = build_session_diff(root, backup_map, unique_preserve(all_written))
 
     polish_result = apply_pass(
         root=root,
@@ -2222,10 +2464,10 @@ def run_five_pass_engine(
         plan_text=plan_text,
         request_history=request_history,
         session_diff=polish_session_diff,
-        backup=backup,
+        backup=backup_map,
     )
 
-    all_written.extend(polish_result.written)
+    all_written.extend(polish_result.changed_files)
 
     print(c("\n✅ Five-pass engine completed.", GREEN))
 
@@ -2305,6 +2547,7 @@ def process_request(
     dry_run: bool,
     auto_commit: bool,
     five_pass_engine: bool,
+    auto_readme: bool,
 ) -> bool:
     project_text, stats = collect_project_context(root)
     show_context_summary(stats)
@@ -2324,6 +2567,7 @@ def process_request(
             ollama_url=ollama_url,
             model=model,
             request_history=request_history,
+            backup=backup,
         )
     else:
         result = apply_pass(
@@ -2341,8 +2585,46 @@ def process_request(
             request_history=request_history,
             backup=backup,
         )
-        written = result.written
+        written = result.changed_files
         validation_ok = result.validation_ok
+
+        if (
+            not result.validation_ok
+            and result.valid_response
+            and not result.no_changes
+        ):
+            print(c("\n🔁 Running corrective pass from validation/test feedback...", YELLOW))
+            validation_text = build_validation_feedback(
+                result.validation_ok,
+                result.validation_reports,
+                result.validation_failures,
+                test_reports=result.test_reports,
+                test_failures=result.test_failures,
+            )
+            refreshed_project_text, _ = collect_project_context(root)
+            correction_result = apply_pass(
+                root=root,
+                project_text=refreshed_project_text,
+                request=request,
+                ollama_url=ollama_url,
+                model=model,
+                plan_text="",
+                request_history=request_history,
+                validation_text=validation_text,
+                backup=backup,
+            )
+            validation_ok = correction_result.validation_ok
+            written = compute_changed_files(root, backup)
+
+    if validation_ok and written and auto_readme:
+        readme_changed, readme_rel = generate_readme_instructions_for_changes(
+            root=root,
+            request=request,
+            changed_files=written,
+            backup=backup,
+        )
+        if readme_changed and readme_rel:
+            written = unique_preserve(written + [readme_rel])
 
     if dry_run:
         print(c("\n🧪 DRY RUN MODE - Restoring original files...", YELLOW))
@@ -2355,9 +2637,9 @@ def process_request(
                 print(f"  - {f}")
 
             if validation_ok:
-                print(c("\n✅ All validations passed.", GREEN))
+                print(c("\n✅ Validation and tests passed.", GREEN))
             else:
-                print(c("\n❌ Some validations failed. Changes were rolled back.", RED))
+                print(c("\n❌ Validation and/or tests failed. Changes were rolled back.", RED))
 
             if auto_commit and validation_ok and written:
                 create_commit(root, request, written)
@@ -2406,6 +2688,13 @@ def main() -> None:
         default=DEFAULT_FIVE_PASS_ENGINE,
         help="Disable the five-pass engine",
     )
+    parser.add_argument(
+        "--no-readme",
+        dest="auto_readme",
+        action="store_false",
+        default=DEFAULT_AUTO_README,
+        help="Disable automatic README instruction generation",
+    )
 
     args = parser.parse_args()
 
@@ -2421,6 +2710,7 @@ def main() -> None:
     dry_run = args.dry_run
     auto_commit = args.auto_commit
     five_pass_engine = args.five_pass_engine
+    auto_readme = args.auto_readme
 
     print(c("Welcome to ollama-code!", BOLD + GREEN))
     print(c(f"Working directory: {root}", MUTED))
@@ -2515,6 +2805,16 @@ def main() -> None:
                 else:
                     five_pass_engine = not five_pass_engine
                     print(c(f"Five-pass engine: {'ON' if five_pass_engine else 'OFF'}", GREEN))
+            elif command == "/readme":
+                if arg.lower() == "on":
+                    auto_readme = True
+                    print(c("README instructions: ON", GREEN))
+                elif arg.lower() == "off":
+                    auto_readme = False
+                    print(c("README instructions: OFF", GREEN))
+                else:
+                    auto_readme = not auto_readme
+                    print(c(f"README instructions: {'ON' if auto_readme else 'OFF'}", GREEN))
             elif command == "/retry":
                 entries = parse_request_history_entries(root)
                 if entries:
@@ -2529,6 +2829,7 @@ def main() -> None:
                         dry_run=dry_run,
                         auto_commit=auto_commit,
                         five_pass_engine=five_pass_engine,
+                        auto_readme=auto_readme,
                     )
                 else:
                     print(c("No previous request to retry.", YELLOW))
@@ -2558,6 +2859,7 @@ def main() -> None:
             dry_run=dry_run,
             auto_commit=auto_commit,
             five_pass_engine=five_pass_engine,
+            auto_readme=auto_readme,
         )
 
 

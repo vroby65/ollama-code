@@ -1,6 +1,6 @@
 # ollama-code
 
-`ollama-code` is a lightweight terminal coding agent that uses local Ollama models to inspect a project, propose code changes, write files, validate syntax, and optionally create a Git commit.
+`ollama-code` is a lightweight terminal coding agent that uses local Ollama models to inspect a project, propose code changes, write files, run validation/tests, and optionally create a Git commit.
 
 The project is intentionally simple: it is a single Python script designed for local, repo-based workflows without cloud dependencies.
 
@@ -16,11 +16,16 @@ The project is intentionally simple: it is a single Python script designed for l
 - Includes an optional multi-pass workflow with draft, review, fix, and polish steps.
 - Uses English as the default CLI and prompt language.
 - Shows cloud-model usage in the interactive prompt status bar when `prompt_toolkit` is available, using per-request compute-time metrics returned by Ollama.
+- Automatically creates/updates `README.md` instructions for generated code changes.
 - Validates modified files before keeping changes:
   - Python via `python3 -m py_compile`
   - JavaScript via `node --check`
   - PHP via `php -l`
   - Shell scripts via `bash -n`
+- Runs project tests automatically when a runner is detected:
+  - Python projects: `python3 -m pytest -q` (or `unittest` fallback)
+  - Node projects: `pnpm test`, `npm test`, or `yarn test`
+- If validation/tests fail, reports the failure and runs a corrective pass.
 - Stores request history and the last raw model response for debugging and retries.
 
 ## Requirements
@@ -33,6 +38,7 @@ Optional but recommended:
 
 - `prompt_toolkit` for a better interactive prompt and completions
 - `prompt_toolkit` is also required for the interactive cloud-usage status bar
+- `pytest` for Python test execution
 - `node` if you want JavaScript syntax validation
 - `php` if you want PHP syntax validation
 
@@ -89,8 +95,10 @@ The tool will:
 1. Inspect the current repository.
 2. Send the project context to Ollama.
 3. Apply returned file changes.
-4. Validate modified files when supported.
-5. Optionally create a Git commit.
+4. Validate modified files and run project tests when available.
+5. If checks fail, run an automatic corrective pass.
+6. Generate/update `README.md` instructions for the generated code.
+7. Optionally create a Git commit.
 
 If the current directory is not a Git repository, `ollama-code` initializes one automatically.
 
@@ -107,6 +115,7 @@ Available options:
 - `--dry-run`: show changes but restore the working tree afterward
 - `--no-commit`: disable automatic Git commits
 - `--no-engine`: disable the five-pass engine
+- `--no-readme`: disable automatic `README.md` instruction generation
 
 The five-pass engine is currently optional and can also be enabled during a session with `/engine on`.
 
@@ -124,6 +133,7 @@ Inside the prompt you can use:
 - `/dry [on|off]`: toggle dry-run mode
 - `/commit [on|off]`: toggle automatic commit mode
 - `/engine [on|off]`: toggle the five-pass engine
+- `/readme [on|off]`: toggle automatic `README.md` instruction generation
 - `/retry`: repeat the last request
 - `/last`: show the last saved raw response
 - `/history`: show recent request history
@@ -137,7 +147,7 @@ If you point the tool directly at `https://ollama.com/api`, set `OLLAMA_API_KEY`
 
 `ollama-code` scans the current repository, skips internal state files, excluded directories, backup folders, binary files, symlinks, and oversized files, then builds a prompt from the remaining text files.
 
-The model must answer with full file blocks in a strict format. The tool writes those files to disk, validates changed files when possible, and restores the previous state automatically if validation fails.
+The model must answer with full file blocks in a strict format. The tool writes those files to disk, validates changed files, runs tests when available, restores the previous state automatically if checks fail, and updates `README.md` instructions for successful generated changes.
 
 When enabled, the multi-pass engine runs this flow:
 
@@ -161,6 +171,10 @@ The Ollama endpoint can be configured with:
 - `--ollama-url`
 - `OLLAMA_HOST`
 
+Optional test command override:
+
+- `OLLAMA_CODE_TEST_COMMAND` (example: `OLLAMA_CODE_TEST_COMMAND="make test"`)
+
 User configuration is stored in:
 
 ```text
@@ -177,7 +191,7 @@ Project/session state files include:
 ## Safety Notes
 
 - The tool refuses absolute paths, parent-directory traversal, `.git` paths, and its own internal state files.
-- Invalid generated code is rolled back automatically when validation fails.
+- Invalid generated code is rolled back automatically when validation/tests fail.
 - Dry-run mode restores the original files after showing the changes.
 - Automatic commits only include files written by the tool, excluding internal state files.
 
