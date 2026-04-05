@@ -573,6 +573,43 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertEqual(selected, "qwen3.5:latest")
         prompt_input_mock.assert_not_called()
 
+    def test_prompt_toggle_selection_uses_prompt_input_with_auto_menu(self):
+        if self.module.Completion is None:
+            self.skipTest("prompt_toolkit Completion unavailable")
+
+        with mock.patch.object(
+            self.module,
+            "get_prompt_session",
+            return_value=mock.Mock(),
+        ), mock.patch.object(
+            self.module,
+            "prompt_input",
+            return_value="off",
+        ) as prompt_input_mock:
+            ok, selected = self.module.prompt_toggle_selection("/plan", True)
+
+        self.assertTrue(ok)
+        self.assertFalse(selected)
+        self.assertTrue(prompt_input_mock.call_args.kwargs.get("open_completion_menu"))
+
+    def test_prompt_toggle_selection_falls_back_to_numeric_when_menu_unavailable(self):
+        with mock.patch.object(
+            self.module,
+            "get_prompt_session",
+            return_value=None,
+        ), mock.patch.object(
+            self.module,
+            "prompt_input",
+        ) as prompt_input_mock, mock.patch(
+            "builtins.input",
+            return_value="0",
+        ):
+            ok, selected = self.module.prompt_toggle_selection("/plan", True)
+
+        self.assertTrue(ok)
+        self.assertFalse(selected)
+        prompt_input_mock.assert_not_called()
+
     def test_save_config_writes_all_runtime_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_home = Path(tmp)

@@ -391,7 +391,7 @@ class SlashCommandCompleter(Completer):
         if command in SLASH_TOGGLE_COMMANDS:
             for option in ("on", "off"):
                 if option.startswith(current_arg_lower):
-                    yield Completion(option, start_position=-len(current_arg), display_meta="toggle")
+                    yield Completion(option, start_position=-len(current_arg))
             return
 
         if command in {"/model", "/fallback-model", "/model-fallback"}:
@@ -413,7 +413,7 @@ class SlashCommandCompleter(Completer):
 
 
 class ChoiceCompleter(Completer):
-    def __init__(self, choices: list[str], display_meta: str = "choice"):
+    def __init__(self, choices: list[str], display_meta: str | None = None):
         self.choices = unique_preserve(choices)
         self.display_meta = display_meta
 
@@ -426,11 +426,14 @@ class ChoiceCompleter(Completer):
 
         for choice in self.choices:
             if choice.lower().startswith(current_lower):
-                yield Completion(
-                    choice,
-                    start_position=-len(current),
-                    display_meta=self.display_meta,
-                )
+                if self.display_meta is None:
+                    yield Completion(choice, start_position=-len(current))
+                else:
+                    yield Completion(
+                        choice,
+                        start_position=-len(current),
+                        display_meta=self.display_meta,
+                    )
 
 
 def get_prompt_session():
@@ -1663,6 +1666,54 @@ def prompt_fallback_model_selection(
         prompt_label="fallback-model",
         include_env_tag=False,
     )
+
+
+def resolve_toggle_choice(raw: str) -> bool | None:
+    normalized = raw.strip().lower()
+    if normalized in {"on", "1", "true", "yes"}:
+        return True
+    if normalized in {"off", "0", "false", "no"}:
+        return False
+    return None
+
+
+def prompt_toggle_selection(command: str, current_value: bool) -> tuple[bool, bool]:
+    completion_menu_available = Completion is not None and get_prompt_session() is not None
+
+    if completion_menu_available:
+        while True:
+            choice = prompt_input(
+                f"{command}> ",
+                YELLOW,
+                completer=ChoiceCompleter(["on", "off"]),
+                open_completion_menu=True,
+            ).strip()
+            if not choice:
+                return False, current_value
+
+            selected = resolve_toggle_choice(choice)
+            if selected is not None:
+                return True, selected
+
+            continue
+
+    print(" 1. on")
+    print(" 0. off")
+    while True:
+        choice = input(cprompt(f"{command}> ", YELLOW)).strip()
+        if not choice:
+            return False, current_value
+
+        if choice == "1":
+            return True, True
+        if choice == "0":
+            return True, False
+
+        selected = resolve_toggle_choice(choice)
+        if selected is not None:
+            return True, selected
+
+        continue
 
 
 def build_plan_prompt(project_text: str, request: str, request_history: str = "") -> str:
@@ -3436,65 +3487,75 @@ def main() -> None:
                         else:
                             print(c("Fallback model reset to automatic.", GREEN))
             elif command == "/plan":
-                if arg.lower() == "on":
-                    plan_mode = True
-                    print(c("Planning mode: ON", GREEN))
-                elif arg.lower() == "off":
-                    plan_mode = False
-                    print(c("Planning mode: OFF", GREEN))
-                else:
-                    plan_mode = not plan_mode
+                selected = resolve_toggle_choice(arg) if arg else None
+                if arg and selected is None:
+                    print(c("Invalid value. Use on/off.", RED))
+                elif arg:
+                    plan_mode = bool(selected)
                     print(c(f"Planning mode: {'ON' if plan_mode else 'OFF'}", GREEN))
-                config["plan_mode"] = plan_mode
-                save_config(root, config)
+                else:
+                    ok, selected_value = prompt_toggle_selection("/plan", plan_mode)
+                    if ok:
+                        plan_mode = selected_value
+                if (arg and selected is not None) or (not arg and ok):
+                    config["plan_mode"] = plan_mode
+                    save_config(root, config)
             elif command == "/dry":
-                if arg.lower() == "on":
-                    dry_run = True
-                    print(c("Dry-run mode: ON", GREEN))
-                elif arg.lower() == "off":
-                    dry_run = False
-                    print(c("Dry-run mode: OFF", GREEN))
-                else:
-                    dry_run = not dry_run
+                selected = resolve_toggle_choice(arg) if arg else None
+                if arg and selected is None:
+                    print(c("Invalid value. Use on/off.", RED))
+                elif arg:
+                    dry_run = bool(selected)
                     print(c(f"Dry-run mode: {'ON' if dry_run else 'OFF'}", GREEN))
-                config["dry_run"] = dry_run
-                save_config(root, config)
+                else:
+                    ok, selected_value = prompt_toggle_selection("/dry", dry_run)
+                    if ok:
+                        dry_run = selected_value
+                if (arg and selected is not None) or (not arg and ok):
+                    config["dry_run"] = dry_run
+                    save_config(root, config)
             elif command == "/commit":
-                if arg.lower() == "on":
-                    auto_commit = True
-                    print(c("Auto-commit: ON", GREEN))
-                elif arg.lower() == "off":
-                    auto_commit = False
-                    print(c("Auto-commit: OFF", GREEN))
-                else:
-                    auto_commit = not auto_commit
+                selected = resolve_toggle_choice(arg) if arg else None
+                if arg and selected is None:
+                    print(c("Invalid value. Use on/off.", RED))
+                elif arg:
+                    auto_commit = bool(selected)
                     print(c(f"Auto-commit: {'ON' if auto_commit else 'OFF'}", GREEN))
-                config["auto_commit"] = auto_commit
-                save_config(root, config)
+                else:
+                    ok, selected_value = prompt_toggle_selection("/commit", auto_commit)
+                    if ok:
+                        auto_commit = selected_value
+                if (arg and selected is not None) or (not arg and ok):
+                    config["auto_commit"] = auto_commit
+                    save_config(root, config)
             elif command == "/engine":
-                if arg.lower() == "on":
-                    five_pass_engine = True
-                    print(c("Five-pass engine: ON", GREEN))
-                elif arg.lower() == "off":
-                    five_pass_engine = False
-                    print(c("Five-pass engine: OFF", GREEN))
-                else:
-                    five_pass_engine = not five_pass_engine
+                selected = resolve_toggle_choice(arg) if arg else None
+                if arg and selected is None:
+                    print(c("Invalid value. Use on/off.", RED))
+                elif arg:
+                    five_pass_engine = bool(selected)
                     print(c(f"Five-pass engine: {'ON' if five_pass_engine else 'OFF'}", GREEN))
-                config["five_pass_engine"] = five_pass_engine
-                save_config(root, config)
-            elif command == "/readme":
-                if arg.lower() == "on":
-                    auto_readme = True
-                    print(c("README instructions: ON", GREEN))
-                elif arg.lower() == "off":
-                    auto_readme = False
-                    print(c("README instructions: OFF", GREEN))
                 else:
-                    auto_readme = not auto_readme
+                    ok, selected_value = prompt_toggle_selection("/engine", five_pass_engine)
+                    if ok:
+                        five_pass_engine = selected_value
+                if (arg and selected is not None) or (not arg and ok):
+                    config["five_pass_engine"] = five_pass_engine
+                    save_config(root, config)
+            elif command == "/readme":
+                selected = resolve_toggle_choice(arg) if arg else None
+                if arg and selected is None:
+                    print(c("Invalid value. Use on/off.", RED))
+                elif arg:
+                    auto_readme = bool(selected)
                     print(c(f"README instructions: {'ON' if auto_readme else 'OFF'}", GREEN))
-                config["auto_readme"] = auto_readme
-                save_config(root, config)
+                else:
+                    ok, selected_value = prompt_toggle_selection("/readme", auto_readme)
+                    if ok:
+                        auto_readme = selected_value
+                if (arg and selected is not None) or (not arg and ok):
+                    config["auto_readme"] = auto_readme
+                    save_config(root, config)
             elif command == "/retry":
                 last_request = load_last_request(root)
                 if last_request is None:
