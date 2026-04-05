@@ -129,6 +129,7 @@ Inside the prompt you can use:
 - `/f`: list project files
 - `/s`: open a shell command prompt
 - `/s <command>`: run a shell command directly
+- `/ollama-url [url]`: show or set the Ollama endpoint
 - `/diff`: show Git diff
 - `/model`: choose an Ollama model interactively
 - `/model <name|number|default>`: switch model

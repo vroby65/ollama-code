@@ -450,6 +450,13 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertTrue(loaded["five_pass_engine"])
         self.assertFalse(loaded["auto_readme"])
 
+    def test_slash_menu_includes_ollama_url_command(self):
+        self.assertIn("/ollama-url", self.module.SLASH_COMMANDS)
+        self.assertEqual(
+            self.module.SLASH_COMMAND_DESCRIPTIONS.get("/ollama-url"),
+            "set/show Ollama endpoint",
+        )
+
     def test_save_config_writes_all_runtime_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_home = Path(tmp)

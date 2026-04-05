@@ -120,6 +120,7 @@ OLLAMA_FALLBACK_MODELS = [
 SLASH_COMMANDS = [
     "/f",
     "/s",
+    "/ollama-url",
     "/diff",
     "/model",
     "/fallback-model",
@@ -137,6 +138,7 @@ SLASH_COMMANDS = [
 SLASH_COMMAND_DESCRIPTIONS = {
     "/f": "list files",
     "/s": "shell",
+    "/ollama-url": "set/show Ollama endpoint",
     "/diff": "diff git",
     "/model": "change model",
     "/fallback-model": "change automatic fallback model",
