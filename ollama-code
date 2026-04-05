@@ -124,6 +124,7 @@ SLASH_COMMANDS = [
     "/diff",
     "/model",
     "/fallback-model",
+    "/model-fallback",
     "/plan",
     "/dry",
     "/commit",
@@ -142,6 +143,7 @@ SLASH_COMMAND_DESCRIPTIONS = {
     "/diff": "diff git",
     "/model": "change model",
     "/fallback-model": "change automatic fallback model",
+    "/model-fallback": "alias for /fallback-model",
     "/plan": "toggle planning",
     "/dry": "toggle dry-run",
     "/commit": "toggle commit",
@@ -359,8 +361,13 @@ class SlashCommandCompleter(Completer):
         parts = text.split()
         has_trailing_space = text.endswith(" ")
         prefix = parts[0] if parts else text
+        complete_model_without_trailing_space = (
+            len(parts) == 1
+            and not has_trailing_space
+            and prefix in {"/model", "/fallback-model", "/model-fallback"}
+        )
 
-        if len(parts) <= 1 and not has_trailing_space:
+        if len(parts) <= 1 and not has_trailing_space and not complete_model_without_trailing_space:
             for command in SLASH_COMMANDS:
                 if command.startswith(prefix):
                     yield Completion(
@@ -375,6 +382,10 @@ class SlashCommandCompleter(Completer):
 
         command = parts[0]
         current_arg = "" if has_trailing_space else parts[-1]
+        prepend_space = False
+        if complete_model_without_trailing_space:
+            current_arg = ""
+            prepend_space = True
         current_arg_lower = current_arg.lower()
 
         if command in SLASH_TOGGLE_COMMANDS:
@@ -383,7 +394,7 @@ class SlashCommandCompleter(Completer):
                     yield Completion(option, start_position=-len(current_arg), display_meta="toggle")
             return
 
-        if command in {"/model", "/fallback-model"}:
+        if command in {"/model", "/fallback-model", "/model-fallback"}:
             config_key = "model" if command == "/model" else "fallback_model"
             current_model = normalize_model_value(self.config.get(config_key))
             discovered_models, _, _ = discover_model_choices(self.ollama_url, current_model)
@@ -397,7 +408,29 @@ class SlashCommandCompleter(Completer):
             )
             for model_name in model_choices:
                 if model_name.lower().startswith(current_arg_lower):
-                    yield Completion(model_name, start_position=-len(current_arg), display_meta="model")
+                    completion_text = f" {model_name}" if prepend_space else model_name
+                    yield Completion(completion_text, start_position=-len(current_arg), display_meta="model")
+
+
+class ChoiceCompleter(Completer):
+    def __init__(self, choices: list[str], display_meta: str = "choice"):
+        self.choices = unique_preserve(choices)
+        self.display_meta = display_meta
+
+    def get_completions(self, document, complete_event):
+        if Completion is None:
+            return
+
+        current = document.text_before_cursor.strip()
+        current_lower = current.lower()
+
+        for choice in self.choices:
+            if choice.lower().startswith(current_lower):
+                yield Completion(
+                    choice,
+                    start_position=-len(current),
+                    display_meta=self.display_meta,
+                )
 
 
 def get_prompt_session():
@@ -419,18 +452,33 @@ def get_prompt_session():
     return _PROMPT_SESSION
 
 
-def prompt_input(prompt_text: str, color: str, completer=None) -> str:
+def prompt_input(
+    prompt_text: str,
+    color: str,
+    completer=None,
+    open_completion_menu: bool = False,
+) -> str:
     session = get_prompt_session()
     if session is None:
         return input(cprompt(prompt_text, color))
 
     toolbar = build_prompt_toolbar()
+    pre_run = None
+    if open_completion_menu and completer is not None:
+        def _pre_run() -> None:
+            try:
+                session.default_buffer.start_completion(select_first=False)
+            except Exception:
+                pass
+        pre_run = _pre_run
+
     value = session.prompt(
         ANSI(cansi(prompt_text, color)),
         completer=completer,
         complete_while_typing=completer is not None,
         reserve_space_for_menu=8,
         bottom_toolbar=toolbar,
+        pre_run=pre_run,
     )
     if value.strip():
         readline.add_history(value)
@@ -1536,17 +1584,44 @@ def prompt_model_selection(
     include_env_tag: bool = True,
 ) -> tuple[bool, str | None]:
     models, note, allow_custom = discover_model_choices(ollama_url, current_model)
+    model_choices = unique_preserve(["default"] + models)
+    env_model = default_model_choice() if include_env_tag else None
+    completion_menu_available = Completion is not None and get_prompt_session() is not None
+
+    if default_label is None:
+        default_label = format_model_name(None)
+
+    if completion_menu_available:
+        print(c(title, BOLD + BLUE))
+        print(c(f"Default: {default_label}", MUTED))
+        if note:
+            print(c(note, MUTED))
+        print(c("Selection menu opens automatically. Enter confirms. Empty input cancels.", MUTED))
+
+        while True:
+            choice = prompt_input(
+                f"{prompt_label}> ",
+                YELLOW,
+                completer=ChoiceCompleter(model_choices, display_meta="model"),
+                open_completion_menu=True,
+            ).strip()
+            if not choice:
+                print(c("Model selection canceled.", YELLOW))
+                return False, None
+
+            ok, selected = resolve_model_choice(choice, models, allow_custom)
+            if ok:
+                return True, selected
+
+            print(c("Invalid model. Try again or press enter to cancel.", RED))
 
     print(c(title, BOLD + BLUE))
 
     default_tags: list[str] = [default_tag]
     if current_model is None:
         default_tags.append("current")
-    if default_label is None:
-        default_label = format_model_name(None)
     print(f" 0. {default_label} ({', '.join(default_tags)})")
 
-    env_model = default_model_choice() if include_env_tag else None
     for idx, model in enumerate(models, start=1):
         tags: list[str] = []
         if model == current_model:
@@ -1560,7 +1635,7 @@ def prompt_model_selection(
     if note:
         print(c(note, MUTED))
 
-    print(c("Type a name, number, or 'default'. You can also enter a custom model name. Press enter to cancel.", MUTED))
+    print(c("Completion menu unavailable: type number/name/default. Press enter to cancel.", MUTED))
 
     while True:
         choice = input(cprompt(f"{prompt_label}> ", YELLOW)).strip()
@@ -3334,7 +3409,7 @@ def main() -> None:
                             print(c(f"Model set to: {model}", GREEN))
                         else:
                             print(c("Model reset to automatic.", GREEN))
-            elif command == "/fallback-model":
+            elif command in {"/fallback-model", "/model-fallback"}:
                 if arg:
                     ok, selected = resolve_model_choice(
                         arg,

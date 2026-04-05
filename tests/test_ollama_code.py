@@ -457,6 +457,122 @@ class OllamaCodeTests(unittest.TestCase):
             "set/show Ollama endpoint",
         )
 
+    def test_slash_menu_includes_model_fallback_alias(self):
+        self.assertIn("/model-fallback", self.module.SLASH_COMMANDS)
+        self.assertEqual(
+            self.module.SLASH_COMMAND_DESCRIPTIONS.get("/model-fallback"),
+            "alias for /fallback-model",
+        )
+
+    def test_model_completion_offers_choices_without_trailing_space(self):
+        if self.module.Completion is None:
+            self.skipTest("prompt_toolkit Completion unavailable")
+
+        config = self.module.build_runtime_config()
+        completer = self.module.SlashCommandCompleter(config, "http://127.0.0.1:11434")
+        document = type("Doc", (), {"text_before_cursor": "/model"})()
+
+        with mock.patch.object(
+            self.module,
+            "discover_model_choices",
+            return_value=(["qwen3.5:latest"], None, True),
+        ):
+            completions = list(completer.get_completions(document, None))
+
+        texts = [completion.text for completion in completions]
+        self.assertIn(" default", texts)
+        self.assertIn(" qwen3.5:latest", texts)
+
+    def test_fallback_model_completion_offers_choices_without_trailing_space(self):
+        if self.module.Completion is None:
+            self.skipTest("prompt_toolkit Completion unavailable")
+
+        config = self.module.build_runtime_config()
+        completer = self.module.SlashCommandCompleter(config, "http://127.0.0.1:11434")
+        document = type("Doc", (), {"text_before_cursor": "/fallback-model"})()
+
+        with mock.patch.object(
+            self.module,
+            "discover_model_choices",
+            return_value=(["mistral:latest"], None, True),
+        ):
+            completions = list(completer.get_completions(document, None))
+
+        texts = [completion.text for completion in completions]
+        self.assertIn(" default", texts)
+        self.assertIn(" mistral:latest", texts)
+
+    def test_model_fallback_alias_completion_offers_choices_without_trailing_space(self):
+        if self.module.Completion is None:
+            self.skipTest("prompt_toolkit Completion unavailable")
+
+        config = self.module.build_runtime_config()
+        completer = self.module.SlashCommandCompleter(config, "http://127.0.0.1:11434")
+        document = type("Doc", (), {"text_before_cursor": "/model-fallback"})()
+
+        with mock.patch.object(
+            self.module,
+            "discover_model_choices",
+            return_value=(["mistral:latest"], None, True),
+        ):
+            completions = list(completer.get_completions(document, None))
+
+        texts = [completion.text for completion in completions]
+        self.assertIn(" default", texts)
+        self.assertIn(" mistral:latest", texts)
+
+    def test_prompt_model_selection_uses_prompt_input_with_completer(self):
+        if self.module.Completion is None:
+            self.skipTest("prompt_toolkit Completion unavailable")
+
+        with mock.patch.object(
+            self.module,
+            "discover_model_choices",
+            return_value=(["qwen3.5:latest"], None, True),
+        ), mock.patch.object(
+            self.module,
+            "get_prompt_session",
+            return_value=mock.Mock(),
+        ), mock.patch.object(
+            self.module,
+            "prompt_input",
+            return_value="qwen3.5:latest",
+        ) as prompt_input_mock:
+            ok, selected = self.module.prompt_model_selection(
+                ollama_url="http://127.0.0.1:11434",
+                current_model=None,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(selected, "qwen3.5:latest")
+        self.assertIsNotNone(prompt_input_mock.call_args.kwargs.get("completer"))
+        self.assertTrue(prompt_input_mock.call_args.kwargs.get("open_completion_menu"))
+
+    def test_prompt_model_selection_falls_back_to_numeric_when_menu_unavailable(self):
+        with mock.patch.object(
+            self.module,
+            "discover_model_choices",
+            return_value=(["qwen3.5:latest"], None, True),
+        ), mock.patch.object(
+            self.module,
+            "get_prompt_session",
+            return_value=None,
+        ), mock.patch.object(
+            self.module,
+            "prompt_input",
+        ) as prompt_input_mock, mock.patch(
+            "builtins.input",
+            return_value="1",
+        ):
+            ok, selected = self.module.prompt_model_selection(
+                ollama_url="http://127.0.0.1:11434",
+                current_model=None,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(selected, "qwen3.5:latest")
+        prompt_input_mock.assert_not_called()
+
     def test_save_config_writes_all_runtime_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake_home = Path(tmp)

@@ -131,9 +131,10 @@ Inside the prompt you can use:
 - `/s <command>`: run a shell command directly
 - `/ollama-url [url]`: show or set the Ollama endpoint
 - `/diff`: show Git diff
-- `/model`: choose an Ollama model interactively
+- `/model`: choose an Ollama model interactively (same autocomplete menu as `/`, auto-open)
 - `/model <name|number|default>`: switch model
-- `/fallback-model`: choose the automatic fallback model interactively
+- `/fallback-model`: choose the automatic fallback model interactively (same autocomplete menu as `/`, auto-open)
+- `/model-fallback`: alias for `/fallback-model`
 - `/fallback-model <name|number|default>`: switch/reset automatic fallback model
 - `/plan [on|off]`: toggle planning mode
 - `/dry [on|off]`: toggle dry-run mode
@@ -144,6 +145,8 @@ Inside the prompt you can use:
 - `/last`: show the last saved raw response
 - `/history`: show recent request summaries
 - `/q`: quit
+
+If the autocomplete menu is not available in your terminal, model selection falls back to numbered choices.
 
 When you are using an Ollama cloud model, the bottom status bar shows the latest cloud usage estimate and the running session total based on the usage durations returned by Ollama's API responses. This status bar is shown only in the richer `prompt_toolkit` prompt.
 
