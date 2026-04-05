@@ -51,22 +51,29 @@ MODEL_DISCOVERY_TIMEOUT_SECONDS = 10
 TEST_RUN_TIMEOUT_SECONDS = 300
 MAX_TEST_OUTPUT_CHARS = 12000
 
-USER_CONFIG_FILE = ".ollama-code"
+USER_STATE_DIR = ".ollama-code"
+USER_CONFIG_FILE = "config.json"
+LEGACY_FLAT_USER_CONFIG_FILE = ".ollama-code"
 LEGACY_USER_CONFIG_FILE = ".tider"
 LEGACY_PROJECT_CONFIG_FILE = ".tider-config.json"
 LAST_RESPONSE_FILE = ".ollama-code-last-response.txt"
 LEGACY_LAST_RESPONSE_FILE = ".tider-last-response.txt"
+LAST_REQUEST_FILE = ".ollama-code-last-request.txt"
 REQUEST_HISTORY_FILE = ".ollama-code-requests-history.txt"
 LEGACY_REQUEST_HISTORY_FILE = ".tider-requests-history.txt"
 REQUEST_SEPARATOR = "\n===END_REQUEST===\n"
 GENERATED_README_START = "<!-- OLLAMA-CODE:GENERATED-INSTRUCTIONS START -->"
 GENERATED_README_END = "<!-- OLLAMA-CODE:GENERATED-INSTRUCTIONS END -->"
+READLINE_HISTORY_FILE = ".ollama-history"
+LEGACY_READLINE_HISTORY_FILES = (".ollama-history", ".ollama_code_history")
 
 OLLAMA_MAX_ATTEMPTS = 3
 OLLAMA_RETRY_DELAY_SECONDS = 2
 OLLAMA_TIMEOUT_SECONDS = 180
+FUNCTIONAL_GUARDRAIL_MAX_FIXES = 2
 
 DEFAULT_MODEL = None
+DEFAULT_FALLBACK_MODEL = None
 DEFAULT_PLAN_MODE = False
 DEFAULT_DRY_RUN = False
 DEFAULT_AUTO_COMMIT = True
@@ -94,11 +101,12 @@ DIFF_CHANGE = "\033[38;5;24m\033[48;5;24m"
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 INTERNAL_STATE_FILES = {
-    USER_CONFIG_FILE,
+    LEGACY_FLAT_USER_CONFIG_FILE,
     LEGACY_USER_CONFIG_FILE,
     LEGACY_PROJECT_CONFIG_FILE,
     LAST_RESPONSE_FILE,
     LEGACY_LAST_RESPONSE_FILE,
+    LAST_REQUEST_FILE,
     REQUEST_HISTORY_FILE,
     LEGACY_REQUEST_HISTORY_FILE,
 }
@@ -114,6 +122,7 @@ SLASH_COMMANDS = [
     "/s",
     "/diff",
     "/model",
+    "/fallback-model",
     "/plan",
     "/dry",
     "/commit",
@@ -130,6 +139,7 @@ SLASH_COMMAND_DESCRIPTIONS = {
     "/s": "shell",
     "/diff": "diff git",
     "/model": "change model",
+    "/fallback-model": "change automatic fallback model",
     "/plan": "toggle planning",
     "/dry": "toggle dry-run",
     "/commit": "toggle commit",
@@ -142,9 +152,11 @@ SLASH_COMMAND_DESCRIPTIONS = {
 }
 
 SLASH_TOGGLE_COMMANDS = {"/plan", "/dry", "/commit", "/engine", "/readme"}
-READLINE_HISTORY_FILE = os.path.expanduser("~/.ollama_code_history")
 
 _PROMPT_SESSION = None
+_CONFIGURED_FALLBACK_MODEL: str | None = DEFAULT_FALLBACK_MODEL
+
+ConfigValue = str | bool | None
 
 TEXT_EXTENSIONS = {
     ".py", ".php", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
@@ -189,6 +201,12 @@ BLOCK_RE = re.compile(
     r"^===FILE:\s*(.*?)\s*===\n(.*?)^===END===\s*$",
     re.MULTILINE | re.DOTALL,
 )
+PATCH_BLOCK_RE = re.compile(
+    r"^===PATCH===\n(.*?)^===END===\s*$",
+    re.MULTILINE | re.DOTALL,
+)
+PATCH_HEADER_RE = re.compile(r"^(---|\+\+\+)\s+([^\n]+)$", re.MULTILINE)
+PATCH_DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$", re.MULTILINE)
 
 
 @dataclass
@@ -327,7 +345,7 @@ def show_colored_file_content(content: str, filename: str) -> None:
 
 
 class SlashCommandCompleter(Completer):
-    def __init__(self, config: dict[str, str | None], ollama_url: str):
+    def __init__(self, config: dict[str, ConfigValue], ollama_url: str):
         self.config = config
         self.ollama_url = ollama_url
 
@@ -363,8 +381,9 @@ class SlashCommandCompleter(Completer):
                     yield Completion(option, start_position=-len(current_arg), display_meta="toggle")
             return
 
-        if command == "/model":
-            current_model = normalize_model_value(self.config.get("model"))
+        if command in {"/model", "/fallback-model"}:
+            config_key = "model" if command == "/model" else "fallback_model"
+            current_model = normalize_model_value(self.config.get(config_key))
             discovered_models, _, _ = discover_model_choices(self.ollama_url, current_model)
             default_model = default_model_choice()
             model_choices = unique_preserve(
@@ -416,6 +435,58 @@ def prompt_input(prompt_text: str, color: str, completer=None) -> str:
     return value
 
 
+def get_user_state_dir() -> Path:
+    return Path.home() / USER_STATE_DIR
+
+
+def get_user_config_path() -> Path:
+    return get_user_state_dir() / USER_CONFIG_FILE
+
+
+def get_legacy_user_config_path() -> Path:
+    return Path.home() / LEGACY_FLAT_USER_CONFIG_FILE
+
+
+def get_readline_history_path() -> Path:
+    return get_user_state_dir() / READLINE_HISTORY_FILE
+
+
+def next_available_path(path: Path, suffix: str) -> Path:
+    candidate = path.with_name(f"{path.name}{suffix}")
+    index = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}{suffix}.{index}")
+        index += 1
+    return candidate
+
+
+def ensure_user_state_dir() -> Path | None:
+    state_dir = get_user_state_dir()
+
+    if state_dir.exists() and state_dir.is_file():
+        backup_path = next_available_path(state_dir, ".legacy")
+        try:
+            state_dir.rename(backup_path)
+            print(
+                c(
+                    f"Migrated legacy user config file {state_dir} to {backup_path}.",
+                    YELLOW,
+                ),
+                file=sys.stderr,
+            )
+        except Exception as exc:
+            print(c(f"Unable to migrate legacy user config file {state_dir}: {exc}", RED), file=sys.stderr)
+            return None
+
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        print(c(f"Unable to create user state directory {state_dir}: {exc}", RED), file=sys.stderr)
+        return None
+
+    return state_dir
+
+
 def setup_readline() -> None:
     readline.parse_and_bind("tab: complete")
     readline.parse_and_bind("set editing-mode emacs")
@@ -426,14 +497,31 @@ def setup_readline() -> None:
     readline.parse_and_bind('"\\C-a": beginning-of-line')
     readline.parse_and_bind('"\\C-e": end-of-line')
 
-    try:
-        readline.read_history_file(READLINE_HISTORY_FILE)
-    except FileNotFoundError:
-        pass
+    history_path: Path | None = None
+    state_dir = ensure_user_state_dir()
+    if state_dir is not None:
+        history_path = state_dir / READLINE_HISTORY_FILE
+
+    read_candidates: list[Path] = []
+    if history_path is not None:
+        read_candidates.append(history_path)
+    read_candidates.extend(Path.home() / name for name in LEGACY_READLINE_HISTORY_FILES)
+
+    for candidate in read_candidates:
+        try:
+            readline.read_history_file(str(candidate))
+            break
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
 
     def save_history() -> None:
+        if history_path is None:
+            return
         try:
-            readline.write_history_file(READLINE_HISTORY_FILE)
+            history_path.parent.mkdir(parents=True, exist_ok=True)
+            readline.write_history_file(str(history_path))
         except Exception:
             pass
 
@@ -757,6 +845,43 @@ def append_request_history(root: Path, request: str) -> None:
         f.write(entry)
 
 
+def save_last_request(root: Path, request: str) -> None:
+    p = root / LAST_REQUEST_FILE
+    content = request.rstrip()
+    if content:
+        content += "\n"
+
+    try:
+        p.write_text(content, encoding="utf-8")
+    except Exception as exc:
+        print(c(f"Unable to save {p}: {exc}", YELLOW), file=sys.stderr)
+
+
+def save_last_response(root: Path, response: str) -> None:
+    p = root / LAST_RESPONSE_FILE
+    content = response.rstrip()
+    if content:
+        content += "\n"
+
+    try:
+        p.write_text(content, encoding="utf-8")
+    except Exception as exc:
+        print(c(f"Unable to save {p}: {exc}", YELLOW), file=sys.stderr)
+
+
+def load_last_request(root: Path) -> str | None:
+    p = root / LAST_REQUEST_FILE
+    if not p.exists():
+        return None
+
+    try:
+        text = p.read_text(encoding="utf-8").strip()
+    except Exception:
+        return None
+
+    return text or None
+
+
 def parse_request_history_entries(root: Path) -> list[tuple[str, str]]:
     p = first_existing_state_path(root, REQUEST_HISTORY_FILE, LEGACY_REQUEST_HISTORY_FILE)
     if not p.exists():
@@ -803,21 +928,10 @@ def build_request_history_context(root: Path) -> str:
     if not entries:
         return ""
 
-    last_timestamp, last_text = entries[-1]
-    older = entries[:-1]
-
     parts: list[str] = []
-
-    if older:
-        recent_older = older[-MAX_HISTORY_SUMMARY_ITEMS:]
-        parts.append("SUMMARIZED PREVIOUS REQUEST HISTORY:")
-        for ts, text in recent_older:
-            parts.append(f"- [{ts}] {one_line_summary(text)}")
-
-    parts.append("")
-    parts.append("LAST FULL PREVIOUS REQUEST:")
-    parts.append(f"[{last_timestamp}]")
-    parts.append(last_text)
+    parts.append("RECENT REQUEST SUMMARIES:")
+    for ts, text in entries[-MAX_HISTORY_SUMMARY_ITEMS:]:
+        parts.append(f"- [{ts}] {one_line_summary(text)}")
 
     result = "\n".join(parts).strip()
 
@@ -883,13 +997,20 @@ def show_context_summary(stats: ProjectContextStats) -> None:
         ))
 
 
-def build_runtime_config() -> dict[str, str | None]:
+def build_runtime_config() -> dict[str, ConfigValue]:
     return {
         "model": DEFAULT_MODEL,
+        "fallback_model": DEFAULT_FALLBACK_MODEL,
+        "ollama_url": None,
+        "plan_mode": DEFAULT_PLAN_MODE,
+        "dry_run": DEFAULT_DRY_RUN,
+        "auto_commit": DEFAULT_AUTO_COMMIT,
+        "five_pass_engine": DEFAULT_FIVE_PASS_ENGINE,
+        "auto_readme": DEFAULT_AUTO_README,
     }
 
 
-def normalize_model_value(value: str | None) -> str | None:
+def normalize_model_value(value: object) -> str | None:
     if value is None:
         return None
 
@@ -907,11 +1028,53 @@ def default_model_choice() -> str | None:
     return normalize_model_value(os.getenv("OLLAMA_MODEL"))
 
 
-def get_user_config_path() -> Path:
-    return Path.home() / USER_CONFIG_FILE
+def configured_fallback_model_choice() -> str | None:
+    return normalize_model_value(_CONFIGURED_FALLBACK_MODEL)
 
 
-def load_config_file(path: Path) -> dict[str, str | None] | None:
+def set_configured_fallback_model(value: str | None) -> None:
+    global _CONFIGURED_FALLBACK_MODEL
+    _CONFIGURED_FALLBACK_MODEL = normalize_model_value(value)
+
+
+def normalize_bool_value(value: object, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return default
+
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+
+    return default
+
+
+def normalize_ollama_url_value(value: object) -> str | None:
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    return default_ollama_url(text)
+
+
+def resolve_runtime_bool_setting(cli_value: bool | None, config_value: object, default: bool) -> bool:
+    if cli_value is not None:
+        return bool(cli_value)
+    return normalize_bool_value(config_value, default)
+
+
+def load_config_file(path: Path) -> dict[str, ConfigValue] | None:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -925,17 +1088,28 @@ def load_config_file(path: Path) -> dict[str, str | None] | None:
     config = build_runtime_config()
 
     config["model"] = normalize_model_value(data.get("model"))
+    config["fallback_model"] = normalize_model_value(data.get("fallback_model"))
+    config["ollama_url"] = normalize_ollama_url_value(data.get("ollama_url"))
+    config["plan_mode"] = normalize_bool_value(data.get("plan_mode"), DEFAULT_PLAN_MODE)
+    config["dry_run"] = normalize_bool_value(data.get("dry_run"), DEFAULT_DRY_RUN)
+    config["auto_commit"] = normalize_bool_value(data.get("auto_commit"), DEFAULT_AUTO_COMMIT)
+    config["five_pass_engine"] = normalize_bool_value(
+        data.get("five_pass_engine"),
+        DEFAULT_FIVE_PASS_ENGINE,
+    )
+    config["auto_readme"] = normalize_bool_value(data.get("auto_readme"), DEFAULT_AUTO_README)
     return config
 
 
-def load_config(root: Path) -> dict[str, str | None]:
+def load_config(root: Path) -> dict[str, ConfigValue]:
     config = build_runtime_config()
     for path in (
         get_user_config_path(),
+        get_legacy_user_config_path(),
         Path.home() / LEGACY_USER_CONFIG_FILE,
         root / LEGACY_PROJECT_CONFIG_FILE,
     ):
-        if not path.exists():
+        if not path.exists() or not path.is_file():
             continue
 
         loaded = load_config_file(path)
@@ -946,14 +1120,27 @@ def load_config(root: Path) -> dict[str, str | None]:
     return config
 
 
-def save_config(_root: Path, config: dict[str, str | None]) -> None:
+def save_config(_root: Path, config: dict[str, ConfigValue]) -> None:
     payload = {
         "model": normalize_model_value(config.get("model")),
+        "fallback_model": normalize_model_value(config.get("fallback_model")),
+        "ollama_url": normalize_ollama_url_value(config.get("ollama_url")),
+        "plan_mode": normalize_bool_value(config.get("plan_mode"), DEFAULT_PLAN_MODE),
+        "dry_run": normalize_bool_value(config.get("dry_run"), DEFAULT_DRY_RUN),
+        "auto_commit": normalize_bool_value(config.get("auto_commit"), DEFAULT_AUTO_COMMIT),
+        "five_pass_engine": normalize_bool_value(
+            config.get("five_pass_engine"),
+            DEFAULT_FIVE_PASS_ENGINE,
+        ),
+        "auto_readme": normalize_bool_value(config.get("auto_readme"), DEFAULT_AUTO_README),
     }
-    path = get_user_config_path()
+    state_dir = ensure_user_state_dir()
+    if state_dir is None:
+        return
+
+    path = state_dir / USER_CONFIG_FILE
 
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(payload, indent=2, ensure_ascii=True) + "\n",
             encoding="utf-8",
@@ -972,6 +1159,13 @@ def format_model_name(model: str | None) -> str:
         return f"automatic ({default_model})"
 
     return "automatic"
+
+
+def format_fallback_model_name(model: str | None) -> str:
+    normalized = normalize_model_value(model)
+    if normalized:
+        return normalized
+    return "automatic (built-in fallback order)"
 
 
 def default_ollama_url(raw: str | None = None) -> str:
@@ -1001,7 +1195,7 @@ def is_cloud_target(model: str | None, ollama_url: str | None) -> bool:
 def sync_session_usage_target(model: str | None, ollama_url: str | None) -> None:
     global _SESSION_USAGE
 
-    resolved = normalize_model_value(model) or default_model_choice()
+    resolved = normalize_model_value(model) or default_model_choice() or configured_fallback_model_choice()
     _SESSION_USAGE.last_resolved_model = resolved
     _SESSION_USAGE.last_target_was_cloud = is_cloud_target(resolved, ollama_url)
     if (
@@ -1015,6 +1209,16 @@ def sync_session_usage_target(model: str | None, ollama_url: str | None) -> None
 
 def pick_auto_model(models: list[str]) -> str | None:
     available = unique_preserve(models)
+    configured_fallback = configured_fallback_model_choice()
+
+    if configured_fallback:
+        if not available:
+            return configured_fallback
+        for model in available:
+            if model.lower() == configured_fallback.lower():
+                return model
+        return configured_fallback
+
     if not available:
         return None
 
@@ -1323,17 +1527,24 @@ def resolve_model_choice(
 def prompt_model_selection(
     ollama_url: str | None,
     current_model: str | None,
+    title: str = "Available Ollama models:",
+    default_label: str | None = None,
+    default_tag: str = "automatic",
+    prompt_label: str = "model",
+    include_env_tag: bool = True,
 ) -> tuple[bool, str | None]:
     models, note, allow_custom = discover_model_choices(ollama_url, current_model)
 
-    print(c("Available Ollama models:", BOLD + BLUE))
+    print(c(title, BOLD + BLUE))
 
-    default_tags: list[str] = ["automatic"]
+    default_tags: list[str] = [default_tag]
     if current_model is None:
         default_tags.append("current")
-    print(f" 0. {format_model_name(None)} ({', '.join(default_tags)})")
+    if default_label is None:
+        default_label = format_model_name(None)
+    print(f" 0. {default_label} ({', '.join(default_tags)})")
 
-    env_model = default_model_choice()
+    env_model = default_model_choice() if include_env_tag else None
     for idx, model in enumerate(models, start=1):
         tags: list[str] = []
         if model == current_model:
@@ -1350,7 +1561,7 @@ def prompt_model_selection(
     print(c("Type a name, number, or 'default'. You can also enter a custom model name. Press enter to cancel.", MUTED))
 
     while True:
-        choice = input(cprompt("model> ", YELLOW)).strip()
+        choice = input(cprompt(f"{prompt_label}> ", YELLOW)).strip()
         if not choice:
             print(c("Model selection canceled.", YELLOW))
             return False, None
@@ -1360,6 +1571,21 @@ def prompt_model_selection(
             return True, selected
 
         print(c("Invalid model. Try again or press enter to cancel.", RED))
+
+
+def prompt_fallback_model_selection(
+    ollama_url: str | None,
+    current_fallback_model: str | None,
+) -> tuple[bool, str | None]:
+    return prompt_model_selection(
+        ollama_url=ollama_url,
+        current_model=current_fallback_model,
+        title="Available fallback models:",
+        default_label=format_fallback_model_name(None),
+        default_tag="automatic",
+        prompt_label="fallback-model",
+        include_env_tag=False,
+    )
 
 
 def build_plan_prompt(project_text: str, request: str, request_history: str = "") -> str:
@@ -1448,10 +1674,14 @@ def build_code_prompt(
     return (
         "Role: terminal coding agent.\n"
         f"Pass objective: {objective}\n"
-        "Reply only with complete contents of modified or new files.\n\n"
+        "Reply only with unified diff patches for modified/new/deleted files.\n\n"
         "MANDATORY FORMAT:\n"
-        "===FILE: relative/path===\n"
-        "full file contents\n"
+        "===PATCH===\n"
+        "--- a/relative/path\n"
+        "+++ b/relative/path\n"
+        "@@ -old,+new @@\n"
+        "-old line\n"
+        "+new line\n"
         "===END===\n\n"
         "RULES:\n"
         "- keep responses coherent and deterministic\n"
@@ -1460,10 +1690,13 @@ def build_code_prompt(
         "- no explanation text\n"
         "- no markdown\n"
         "- no ``` blocks\n"
-        "- return only modified or new files\n"
-        "- use only relative paths\n"
+        "- return only patch blocks\n"
+        "- use only project-relative paths with a/ and b/ prefixes\n"
         "- do not touch ollama-code internal files\n"
         "- do not return unchanged files\n"
+        "- each patch block must be a valid unified diff\n"
+        "- for new files use '--- /dev/null' and '+++ b/path'\n"
+        "- for deletions use '--- a/path' and '+++ /dev/null'\n"
         "- always close each block with a separate line containing exactly ===END===\n"
         "- if nothing needs to change, return exactly: NO_CHANGES\n\n"
         f"{history_section}"
@@ -1572,6 +1805,36 @@ def build_change_summary_prompt(request: str, diff_text: str) -> str:
     )
 
 
+def build_request_summary_prompt(request: str) -> str:
+    return (
+        "You summarize a user request for coding work.\n"
+        "Write exactly one concise sentence in the same language as the request.\n"
+        "Keep only the core objective and key targets.\n"
+        "No markdown, no bullets, no quotes, no extra text.\n\n"
+        "REQUEST:\n"
+        f"{request}\n"
+    )
+
+
+def summarize_request_for_history(request: str, ollama_url: str, model: str | None) -> str:
+    summary_prompt = build_request_summary_prompt(request)
+    raw_summary = call_ollama(summary_prompt, ollama_url, model, plan_mode=False).strip()
+    if not raw_summary:
+        return one_line_summary(request)
+
+    first_line = raw_summary.splitlines()[0].strip()
+    if first_line.lower().startswith("summary:"):
+        first_line = first_line[len("summary:"):].strip()
+
+    while first_line.startswith("-"):
+        first_line = first_line[1:].strip()
+
+    if not first_line or first_line.upper() == "NO_CHANGES":
+        return one_line_summary(request)
+
+    return one_line_summary(first_line)
+
+
 THINK_BLOCK_RE = re.compile(
     r"<\s*(?:think|thinking)\b[^>]*>.*?<\s*/\s*(?:think|thinking)\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -1620,9 +1883,18 @@ def clean_ollama_output(text: str) -> str:
     if stripped == "NO_CHANGES":
         return "NO_CHANGES"
 
-    pos = text.find("===FILE:")
-    if pos != -1:
-        text = text[pos:]
+    first_positions = [
+        pos for pos in (
+            text.find("===PATCH==="),
+            text.find("diff --git "),
+            text.find("--- a/"),
+            text.find("--- /dev/null"),
+            text.find("===FILE:"),
+        )
+        if pos != -1
+    ]
+    if first_positions:
+        text = text[min(first_positions):]
 
     stripped = text.strip("\n")
     if not stripped:
@@ -1728,7 +2000,7 @@ def call_ollama(
         print(c("Error while running Ollama.", RED), file=sys.stderr)
         print(
             c(
-                "No model configured or available. Use /model or set OLLAMA_MODEL.",
+                "No model configured or available. Use /model, /fallback-model, or set OLLAMA_MODEL.",
                 YELLOW,
             ),
             file=sys.stderr,
@@ -1836,6 +2108,126 @@ def parse_file_blocks(text: str) -> Dict[str, str]:
         if path:
             result[path] = content.rstrip("\n") + "\n"
     return result
+
+
+def parse_patch_blocks(text: str) -> list[str]:
+    blocks = [block.strip("\n") for block in PATCH_BLOCK_RE.findall(text) if block.strip()]
+    if blocks:
+        return [block + "\n" for block in blocks]
+
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    has_unified_markers = (
+        stripped.startswith("diff --git ")
+        or (
+            stripped.startswith("--- ")
+            and "\n+++ " in stripped
+            and "\n@@" in stripped
+        )
+    )
+    if has_unified_markers:
+        return [stripped + "\n"]
+
+    return []
+
+
+def normalize_patch_header_path(raw_path: str) -> str | None:
+    text = raw_path.strip()
+    if not text:
+        return None
+
+    text = text.split("\t", 1)[0].strip()
+    if text == "/dev/null":
+        return None
+
+    if text.startswith('"') and text.endswith('"') and len(text) >= 2:
+        text = text[1:-1]
+
+    if text.startswith(("a/", "b/")):
+        text = text[2:]
+
+    return text.strip() or None
+
+
+def extract_patch_paths(patch_text: str) -> tuple[list[str], list[str]]:
+    touched: list[str] = []
+    rejected: list[str] = []
+
+    for _, raw_path in PATCH_HEADER_RE.findall(patch_text):
+        rel = normalize_patch_header_path(raw_path)
+        if rel is None:
+            continue
+        if not is_valid_relpath(rel):
+            rejected.append(rel)
+            continue
+        touched.append(rel)
+
+    for old_path, new_path in PATCH_DIFF_GIT_RE.findall(patch_text):
+        for raw_path in (old_path, new_path):
+            rel = normalize_patch_header_path(raw_path)
+            if rel is None:
+                continue
+            if not is_valid_relpath(rel):
+                rejected.append(rel)
+                continue
+            touched.append(rel)
+
+    return unique_preserve(touched), unique_preserve(rejected)
+
+
+def check_unified_patch(root: Path, patch_text: str) -> tuple[bool, str]:
+    cp = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "apply",
+            "--check",
+            "--whitespace=nowarn",
+            "--recount",
+            "--unidiff-zero",
+            "-",
+        ],
+        input=patch_text,
+        text=True,
+        capture_output=True,
+    )
+
+    if cp.returncode == 0:
+        return True, ""
+
+    output = ((cp.stderr or "").strip() or (cp.stdout or "").strip())
+    if not output:
+        output = "git apply --check failed."
+    return False, output
+
+
+def apply_unified_patch(root: Path, patch_text: str) -> tuple[bool, str]:
+    cp = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "apply",
+            "--whitespace=nowarn",
+            "--recount",
+            "--unidiff-zero",
+            "-",
+        ],
+        input=patch_text,
+        text=True,
+        capture_output=True,
+    )
+
+    if cp.returncode == 0:
+        return True, ""
+
+    output = ((cp.stderr or "").strip() or (cp.stdout or "").strip())
+    if not output:
+        output = "git apply failed."
+    return False, output
 
 
 def read_text_snapshot(path: Path) -> str | None:
@@ -2053,6 +2445,9 @@ def validate_written_files(root: Path, written: list[str]) -> tuple[bool, list[s
             continue
 
         path = root / rel
+        if not path.exists():
+            continue
+
         kind, ok, msg = validate_file(path)
 
         if kind is None:
@@ -2184,7 +2579,7 @@ def build_generated_readme_instructions(
         "## Generated Code Instructions",
         "",
         f"- Generated at: `{timestamp}`",
-        f"- Original request: `{preview_text(request, max_chars=220)}`",
+        "- Original request: recorded in `.ollama-code-last-request.txt` and request history.",
         "",
         "### Changed Files",
     ]
@@ -2303,6 +2698,7 @@ def apply_pass(
     )
 
     response = call_ollama(prompt, ollama_url, model, plan_mode=False)
+    save_last_response(root, response)
 
     result = AppliedPassResult(
         response=response,
@@ -2317,29 +2713,67 @@ def apply_pass(
         result.no_changes = True
         return result
 
-    files_map = parse_file_blocks(response)
-    result.files_map = files_map
+    patch_blocks = parse_patch_blocks(response)
+    wrote_from_patch = False
+    if patch_blocks:
+        patch_text = "\n".join(block.rstrip("\n") for block in patch_blocks).strip()
+        if patch_text:
+            patch_text += "\n"
 
-    if not files_map:
-        result.valid_response = False
-        return result
+        rel_paths, rejected = extract_patch_paths(patch_text)
+        result.rejected = rejected
 
-    rel_paths = list(files_map.keys())
-    restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
-    if backup is not None:
-        extend_backup(root, backup, rel_paths)
+        if rejected:
+            print(c(f"\n❌ Patch rejected: invalid paths: {', '.join(rejected)}", RED))
+            result.valid_response = False
+            return result
 
-    written, rejected = write_files(root, files_map)
-    result.written = written
-    result.rejected = rejected
+        if not rel_paths:
+            result.valid_response = False
+            return result
 
-    if written:
+        patch_ok, patch_error = check_unified_patch(root, patch_text)
+        if not patch_ok:
+            print(c(f"\n❌ Patch check failed: {preview_text(patch_error, max_chars=300)}", RED))
+            result.valid_response = False
+            return result
+
+        restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
+        if backup is not None:
+            extend_backup(root, backup, rel_paths)
+
+        applied, patch_error = apply_unified_patch(root, patch_text)
+        if not applied:
+            print(c(f"\n❌ Patch apply failed: {preview_text(patch_error, max_chars=300)}", RED))
+            result.valid_response = False
+            return result
+
+        result.written = rel_paths
+        wrote_from_patch = True
+    else:
+        files_map = parse_file_blocks(response)
+        result.files_map = files_map
+
+        if not files_map:
+            result.valid_response = False
+            return result
+
+        rel_paths = list(files_map.keys())
+        restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
+        if backup is not None:
+            extend_backup(root, backup, rel_paths)
+
+        written, rejected = write_files(root, files_map)
+        result.written = written
+        result.rejected = rejected
+
+    if result.written or wrote_from_patch:
         changed = compute_changed_files(root, restore_snapshot)
         result.changed_files = changed
-        if not changed and not rejected:
+        if not changed and not result.rejected:
             result.no_changes = True
 
-        valid, reports, failures = validate_written_files(root, changed or written)
+        valid, reports, failures = validate_written_files(root, changed or result.written)
         result.validation_reports = reports
         result.validation_failures = failures
 
@@ -2474,7 +2908,91 @@ def run_five_pass_engine(
     return polish_result.validation_ok, unique_preserve(all_written)
 
 
-def make_commit_message(root: Path, request: str, written: list[str]) -> str:
+def review_verdict_ok(review_text: str) -> bool:
+    for line in review_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.upper().startswith("VERDICT:"):
+            verdict = stripped.split(":", 1)[1].strip().upper()
+            return verdict == "OK"
+    return False
+
+
+def enforce_functional_guardrail(
+    root: Path,
+    request: str,
+    ollama_url: str,
+    model: str | None,
+    request_history: str,
+    backup: dict[str, str | None],
+    written: list[str],
+    plan_text: str = "",
+) -> tuple[bool, list[str]]:
+    changed = unique_preserve(written)
+    if not changed:
+        return True, changed
+
+    for attempt in range(FUNCTIONAL_GUARDRAIL_MAX_FIXES + 1):
+        review_project_text, _ = collect_project_context(root)
+        session_diff = build_session_diff(root, backup, changed)
+        review_prompt = build_review_prompt(
+            project_text=review_project_text,
+            request=request,
+            plan_text=plan_text,
+            request_history=request_history,
+            session_diff=session_diff,
+        )
+        review_text = clean_plan_output(call_ollama(review_prompt, ollama_url, model, plan_mode=False))
+
+        if review_verdict_ok(review_text):
+            print(c("\n✅ Functional guardrail: request verified.", GREEN))
+            return True, changed
+
+        if attempt >= FUNCTIONAL_GUARDRAIL_MAX_FIXES:
+            break
+
+        print(c(
+            (
+                f"\n⚠️ Functional guardrail found gaps (fix pass {attempt + 1}/"
+                f"{FUNCTIONAL_GUARDRAIL_MAX_FIXES}). Reworking..."
+            ),
+            YELLOW,
+        ))
+
+        fix_result = apply_pass(
+            root=root,
+            project_text=review_project_text,
+            request=request,
+            ollama_url=ollama_url,
+            model=model,
+            plan_text=plan_text,
+            request_history=request_history,
+            review_text=review_text,
+            session_diff=session_diff,
+            backup=backup,
+        )
+
+        changed = unique_preserve(compute_changed_files(root, backup))
+
+        if not fix_result.validation_ok:
+            return False, changed
+
+    print(c(
+        "\n❌ Functional guardrail could not verify the request after multiple fix passes. Rolling back.",
+        RED,
+    ))
+    restore_files(root, backup)
+    return False, compute_changed_files(root, backup)
+
+
+def make_commit_message(
+    root: Path,
+    request: str,
+    written: list[str],
+    ollama_url: str,
+    model: str | None,
+) -> str:
     if not written:
         return "ollama-code: no changes"
 
@@ -2487,7 +3005,7 @@ def make_commit_message(root: Path, request: str, written: list[str]) -> str:
         diff_text = diff_text[:MAX_SUMMARY_DIFF_CHARS].rstrip() + "\n...[DIFF TRUNCATED]...\n"
 
     summary_prompt = build_change_summary_prompt(request, diff_text)
-    summary = call_ollama(summary_prompt, default_ollama_url(), None, plan_mode=False)
+    summary = call_ollama(summary_prompt, ollama_url, model, plan_mode=False)
 
     if summary.strip():
         lines = summary.strip().splitlines()
@@ -2511,7 +3029,13 @@ def make_commit_message(root: Path, request: str, written: list[str]) -> str:
     return f"ollama-code: {short_request}"
 
 
-def create_commit(root: Path, request: str, written: list[str]) -> bool:
+def create_commit(
+    root: Path,
+    request: str,
+    written: list[str],
+    ollama_url: str,
+    model: str | None,
+) -> bool:
     files = [f for f in written if f not in INTERNAL_STATE_FILES]
     if not files:
         return False
@@ -2524,7 +3048,7 @@ def create_commit(root: Path, request: str, written: list[str]) -> bool:
     if not has_staged_changes():
         return False
 
-    message = make_commit_message(root, request, written)
+    message = make_commit_message(root, request, written, ollama_url, model)
     cp = run(["git", "commit", "-m", message], check=False)
 
     if cp.returncode == 0:
@@ -2549,11 +3073,15 @@ def process_request(
     five_pass_engine: bool,
     auto_readme: bool,
 ) -> bool:
-    project_text, stats = collect_project_context(root)
-    show_context_summary(stats)
+    save_last_request(root, request)
 
     request_history = build_request_history_context(root)
-    append_request_history(root, request)
+    request_summary = summarize_request_for_history(request, ollama_url, model)
+    print(c(f"Request summary: {request_summary}", CYAN))
+    append_request_history(root, request_summary)
+
+    project_text, stats = collect_project_context(root)
+    show_context_summary(stats)
 
     backup: dict[str, str | None] = {}
     written: list[str] = []
@@ -2616,6 +3144,18 @@ def process_request(
             validation_ok = correction_result.validation_ok
             written = compute_changed_files(root, backup)
 
+    if validation_ok and written:
+        validation_ok, written = enforce_functional_guardrail(
+            root=root,
+            request=request,
+            ollama_url=ollama_url,
+            model=model,
+            request_history=request_history,
+            backup=backup,
+            written=written,
+            plan_text="",
+        )
+
     if validation_ok and written and auto_readme:
         readme_changed, readme_rel = generate_readme_instructions_for_changes(
             root=root,
@@ -2642,7 +3182,13 @@ def process_request(
                 print(c("\n❌ Validation and/or tests failed. Changes were rolled back.", RED))
 
             if auto_commit and validation_ok and written:
-                create_commit(root, request, written)
+                create_commit(
+                    root,
+                    request,
+                    written,
+                    ollama_url=ollama_url,
+                    model=model,
+                )
 
     if DEFAULT_SHOW_DIFF and not dry_run and written:
         show_written_files_diff(written, backup, root)
@@ -2664,53 +3210,65 @@ def main() -> None:
         "--plan",
         dest="plan_mode",
         action="store_true",
-        default=DEFAULT_PLAN_MODE,
+        default=None,
         help="Ask Ollama for a plan before generating code",
     )
     parser.add_argument(
         "--dry-run",
         dest="dry_run",
         action="store_true",
-        default=DEFAULT_DRY_RUN,
+        default=None,
         help="Show changes but restore the working tree afterward",
     )
     parser.add_argument(
         "--no-commit",
         dest="auto_commit",
         action="store_false",
-        default=DEFAULT_AUTO_COMMIT,
+        default=None,
         help="Disable automatic Git commits",
     )
     parser.add_argument(
         "--no-engine",
         dest="five_pass_engine",
         action="store_false",
-        default=DEFAULT_FIVE_PASS_ENGINE,
+        default=None,
         help="Disable the five-pass engine",
     )
     parser.add_argument(
         "--no-readme",
         dest="auto_readme",
         action="store_false",
-        default=DEFAULT_AUTO_README,
+        default=None,
         help="Disable automatic README instruction generation",
     )
 
     args = parser.parse_args()
-
-    ollama_url = args.ollama_url or default_ollama_url()
     root = ensure_git_repo()
 
-    setup_readline()
-
     config = load_config(root)
-    model = config.get("model")
+    model = normalize_model_value(config.get("model"))
+    fallback_model = normalize_model_value(config.get("fallback_model"))
+    set_configured_fallback_model(fallback_model)
 
-    plan_mode = args.plan_mode
-    dry_run = args.dry_run
-    auto_commit = args.auto_commit
-    five_pass_engine = args.five_pass_engine
-    auto_readme = args.auto_readme
+    configured_ollama_url = normalize_ollama_url_value(config.get("ollama_url"))
+    if args.ollama_url:
+        ollama_url = default_ollama_url(args.ollama_url)
+    elif configured_ollama_url:
+        ollama_url = configured_ollama_url
+    else:
+        ollama_url = default_ollama_url()
+
+    plan_mode = resolve_runtime_bool_setting(args.plan_mode, config.get("plan_mode"), DEFAULT_PLAN_MODE)
+    dry_run = resolve_runtime_bool_setting(args.dry_run, config.get("dry_run"), DEFAULT_DRY_RUN)
+    auto_commit = resolve_runtime_bool_setting(args.auto_commit, config.get("auto_commit"), DEFAULT_AUTO_COMMIT)
+    five_pass_engine = resolve_runtime_bool_setting(
+        args.five_pass_engine,
+        config.get("five_pass_engine"),
+        DEFAULT_FIVE_PASS_ENGINE,
+    )
+    auto_readme = resolve_runtime_bool_setting(args.auto_readme, config.get("auto_readme"), DEFAULT_AUTO_README)
+
+    setup_readline()
 
     print(c("Welcome to ollama-code!", BOLD + GREEN))
     print(c(f"Working directory: {root}", MUTED))
@@ -2765,6 +3323,32 @@ def main() -> None:
                             print(c(f"Model set to: {model}", GREEN))
                         else:
                             print(c("Model reset to automatic.", GREEN))
+            elif command == "/fallback-model":
+                if arg:
+                    ok, selected = resolve_model_choice(
+                        arg,
+                        discover_ollama_models(ollama_url),
+                        allow_custom=True,
+                    )
+                    if ok:
+                        fallback_model = selected
+                        config["fallback_model"] = fallback_model
+                        set_configured_fallback_model(fallback_model)
+                        save_config(root, config)
+                        print(c(f"Fallback model set to: {format_fallback_model_name(fallback_model)}", GREEN))
+                    else:
+                        print(c("Invalid fallback model.", RED))
+                else:
+                    ok, selected = prompt_fallback_model_selection(ollama_url, fallback_model)
+                    if ok:
+                        fallback_model = selected
+                        config["fallback_model"] = fallback_model
+                        set_configured_fallback_model(fallback_model)
+                        save_config(root, config)
+                        if fallback_model:
+                            print(c(f"Fallback model set to: {fallback_model}", GREEN))
+                        else:
+                            print(c("Fallback model reset to automatic.", GREEN))
             elif command == "/plan":
                 if arg.lower() == "on":
                     plan_mode = True
@@ -2775,6 +3359,8 @@ def main() -> None:
                 else:
                     plan_mode = not plan_mode
                     print(c(f"Planning mode: {'ON' if plan_mode else 'OFF'}", GREEN))
+                config["plan_mode"] = plan_mode
+                save_config(root, config)
             elif command == "/dry":
                 if arg.lower() == "on":
                     dry_run = True
@@ -2785,6 +3371,8 @@ def main() -> None:
                 else:
                     dry_run = not dry_run
                     print(c(f"Dry-run mode: {'ON' if dry_run else 'OFF'}", GREEN))
+                config["dry_run"] = dry_run
+                save_config(root, config)
             elif command == "/commit":
                 if arg.lower() == "on":
                     auto_commit = True
@@ -2795,6 +3383,8 @@ def main() -> None:
                 else:
                     auto_commit = not auto_commit
                     print(c(f"Auto-commit: {'ON' if auto_commit else 'OFF'}", GREEN))
+                config["auto_commit"] = auto_commit
+                save_config(root, config)
             elif command == "/engine":
                 if arg.lower() == "on":
                     five_pass_engine = True
@@ -2805,6 +3395,8 @@ def main() -> None:
                 else:
                     five_pass_engine = not five_pass_engine
                     print(c(f"Five-pass engine: {'ON' if five_pass_engine else 'OFF'}", GREEN))
+                config["five_pass_engine"] = five_pass_engine
+                save_config(root, config)
             elif command == "/readme":
                 if arg.lower() == "on":
                     auto_readme = True
@@ -2815,10 +3407,16 @@ def main() -> None:
                 else:
                     auto_readme = not auto_readme
                     print(c(f"README instructions: {'ON' if auto_readme else 'OFF'}", GREEN))
+                config["auto_readme"] = auto_readme
+                save_config(root, config)
             elif command == "/retry":
-                entries = parse_request_history_entries(root)
-                if entries:
-                    _, last_request = entries[-1]
+                last_request = load_last_request(root)
+                if last_request is None:
+                    entries = parse_request_history_entries(root)
+                    if entries:
+                        _, last_request = entries[-1]
+
+                if last_request:
                     print(c(f"Retrying: {preview_text(last_request)}", CYAN))
                     process_request(
                         root=root,

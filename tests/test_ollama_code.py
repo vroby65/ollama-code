@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -158,6 +160,204 @@ class OllamaCodeTests(unittest.TestCase):
             self.assertEqual(result.changed_files, [])
             self.assertEqual(target.read_text(encoding="utf-8"), "print('old')\n")
 
+    def test_check_unified_patch_detects_invalid_patch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+
+            target = root / "demo.py"
+            target.write_text("print('old')\n", encoding="utf-8")
+
+            patch_text = (
+                "--- a/demo.py\n"
+                "+++ b/demo.py\n"
+                "@@ -1 +1 @@\n"
+                "-print('missing old line')\n"
+                "+print('new')\n"
+            )
+
+            ok, error = self.module.check_unified_patch(root, patch_text)
+
+        self.assertFalse(ok)
+        self.assertTrue(error)
+
+    def test_apply_unified_patch_updates_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+
+            target = root / "demo.py"
+            target.write_text("print('old')\n", encoding="utf-8")
+
+            patch_text = (
+                "--- a/demo.py\n"
+                "+++ b/demo.py\n"
+                "@@ -1 +1 @@\n"
+                "-print('old')\n"
+                "+print('new')\n"
+            )
+
+            ok, error = self.module.apply_unified_patch(root, patch_text)
+            self.assertTrue(ok, error)
+            self.assertEqual(target.read_text(encoding="utf-8"), "print('new')\n")
+
+    def test_apply_pass_applies_patch_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+
+            target = root / "demo.py"
+            target.write_text("print('old')\n", encoding="utf-8")
+
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False):
+                return (
+                    "===PATCH===\n"
+                    "--- a/demo.py\n"
+                    "+++ b/demo.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-print('old')\n"
+                    "+print('new')\n"
+                    "===END===\n"
+                )
+
+            with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
+                self.module,
+                "validate_written_files",
+                return_value=(True, ["demo.py (python): ok"], []),
+            ), mock.patch.object(
+                self.module,
+                "run_project_tests",
+                return_value=(True, [], []),
+            ):
+                result = self.module.apply_pass(
+                    root=root,
+                    project_text="",
+                    request="change demo.py",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    backup={},
+                )
+
+            self.assertTrue(result.validation_ok)
+            self.assertEqual(result.changed_files, ["demo.py"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "print('new')\n")
+
+    def test_apply_pass_rejects_invalid_patch_paths_before_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False):
+                return (
+                    "===PATCH===\n"
+                    "--- /dev/null\n"
+                    "+++ b/../evil.py\n"
+                    "@@ -0,0 +1 @@\n"
+                    "+print('x')\n"
+                    "===END===\n"
+                )
+
+            with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
+                self.module,
+                "check_unified_patch",
+            ) as check_mock, mock.patch.object(
+                self.module,
+                "apply_unified_patch",
+            ) as apply_mock:
+                result = self.module.apply_pass(
+                    root=root,
+                    project_text="",
+                    request="attempt invalid path",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    backup={},
+                )
+
+        self.assertFalse(result.valid_response)
+        self.assertIn("../evil.py", result.rejected)
+        check_mock.assert_not_called()
+        apply_mock.assert_not_called()
+
+    def test_apply_pass_stops_when_patch_check_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+
+            target = root / "demo.py"
+            target.write_text("print('old')\n", encoding="utf-8")
+
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False):
+                return (
+                    "===PATCH===\n"
+                    "--- a/demo.py\n"
+                    "+++ b/demo.py\n"
+                    "@@ -1 +1 @@\n"
+                    "-print('old')\n"
+                    "+print('new')\n"
+                    "===END===\n"
+                )
+
+            with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
+                self.module,
+                "check_unified_patch",
+                return_value=(False, "hunk failed"),
+            ), mock.patch.object(
+                self.module,
+                "apply_unified_patch",
+            ) as apply_mock:
+                result = self.module.apply_pass(
+                    root=root,
+                    project_text="",
+                    request="change demo.py",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    backup={},
+                )
+
+            self.assertFalse(result.valid_response)
+            self.assertEqual(target.read_text(encoding="utf-8"), "print('old')\n")
+            apply_mock.assert_not_called()
+
+    def test_apply_pass_saves_last_response_for_last_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            with mock.patch.object(self.module, "call_ollama", return_value="NO_CHANGES"):
+                result = self.module.apply_pass(
+                    root=root,
+                    project_text="",
+                    request="no-op request",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    backup={},
+                )
+
+            saved = (root / self.module.LAST_RESPONSE_FILE).read_text(encoding="utf-8")
+
+        self.assertTrue(result.no_changes)
+        self.assertEqual(saved, "NO_CHANGES\n")
+
+    def test_validate_written_files_skips_deleted_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing = root / "keep.py"
+            existing.write_text("print('ok')\n", encoding="utf-8")
+
+            with mock.patch.object(
+                self.module,
+                "validate_file",
+                return_value=("python", True, "ok"),
+            ) as validate_mock:
+                ok, reports, failures = self.module.validate_written_files(
+                    root,
+                    ["deleted.py", "keep.py"],
+                )
+
+        self.assertTrue(ok)
+        self.assertEqual(reports, ["keep.py (python): ok"])
+        self.assertEqual(failures, [])
+        validate_mock.assert_called_once_with(existing)
+
     def test_generate_readme_instructions_for_changes_creates_readme(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -183,7 +383,10 @@ class OllamaCodeTests(unittest.TestCase):
             readme = (root / "README.md").read_text(encoding="utf-8")
             self.assertIn(self.module.GENERATED_README_START, readme)
             self.assertIn("`src.py`", readme)
-            self.assertIn("aggiungi logging strutturato", readme)
+            self.assertIn(
+                "Original request: recorded in `.ollama-code-last-request.txt` and request history.",
+                readme,
+            )
 
     def test_upsert_generated_readme_section_replaces_previous_block(self):
         existing = (
@@ -198,6 +401,327 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertNotIn("old section", updated)
         self.assertEqual(updated.count(self.module.GENERATED_README_START), 1)
         self.assertEqual(updated.count(self.module.GENERATED_README_END), 1)
+
+    def test_load_config_file_reads_fallback_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / ".ollama-code"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "model": "qwen2.5-coder:latest",
+                        "fallback_model": "mistral:latest",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = self.module.load_config_file(config_path)
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["model"], "qwen2.5-coder:latest")
+        self.assertEqual(loaded["fallback_model"], "mistral:latest")
+
+    def test_load_config_file_reads_runtime_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / ".ollama-code"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "model": "qwen2.5-coder:latest",
+                        "fallback_model": "mistral:latest",
+                        "ollama_url": "127.0.0.1:11434",
+                        "plan_mode": True,
+                        "dry_run": "true",
+                        "auto_commit": "false",
+                        "five_pass_engine": 1,
+                        "auto_readme": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = self.module.load_config_file(config_path)
+
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded["ollama_url"], "http://127.0.0.1:11434")
+        self.assertTrue(loaded["plan_mode"])
+        self.assertTrue(loaded["dry_run"])
+        self.assertFalse(loaded["auto_commit"])
+        self.assertTrue(loaded["five_pass_engine"])
+        self.assertFalse(loaded["auto_readme"])
+
+    def test_save_config_writes_all_runtime_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            with mock.patch.object(self.module.Path, "home", return_value=fake_home):
+                self.module.save_config(
+                    fake_home,
+                    {
+                        "model": "qwen2.5-coder:latest",
+                        "fallback_model": "mistral:latest",
+                        "ollama_url": "http://127.0.0.1:11434",
+                        "plan_mode": True,
+                        "dry_run": True,
+                        "auto_commit": False,
+                        "five_pass_engine": True,
+                        "auto_readme": False,
+                    },
+                )
+
+            saved_path = fake_home / ".ollama-code" / "config.json"
+            self.assertTrue(saved_path.exists())
+            saved = json.loads(saved_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(saved["model"], "qwen2.5-coder:latest")
+        self.assertEqual(saved["fallback_model"], "mistral:latest")
+        self.assertEqual(saved["ollama_url"], "http://127.0.0.1:11434")
+        self.assertTrue(saved["plan_mode"])
+        self.assertTrue(saved["dry_run"])
+        self.assertFalse(saved["auto_commit"])
+        self.assertTrue(saved["five_pass_engine"])
+        self.assertFalse(saved["auto_readme"])
+
+    def test_pick_auto_model_prefers_configured_fallback(self):
+        self.module.set_configured_fallback_model("custom-fallback:latest")
+        selected = self.module.pick_auto_model(["qwen3.5:latest", "mistral:latest"])
+        self.assertEqual(selected, "custom-fallback:latest")
+
+    def test_summarize_request_for_history_uses_model_response(self):
+        with mock.patch.object(
+            self.module,
+            "call_ollama",
+            return_value="SUMMARY: aggiorna autenticazione e aggiungi test",
+        ):
+            summary = self.module.summarize_request_for_history(
+                "sistema login e aggiungi test",
+                "http://127.0.0.1:11434",
+                "test-model",
+            )
+
+        self.assertEqual(summary, "aggiorna autenticazione e aggiungi test")
+
+    def test_summarize_request_for_history_falls_back_to_request(self):
+        request = "aggiorna endpoint API per includere controllo token e log strutturato"
+        with mock.patch.object(self.module, "call_ollama", return_value=""):
+            summary = self.module.summarize_request_for_history(
+                request,
+                "http://127.0.0.1:11434",
+                "test-model",
+            )
+
+        self.assertEqual(summary, self.module.one_line_summary(request))
+
+    def test_make_commit_message_uses_runtime_endpoint_and_model(self):
+        fake_cp = mock.Mock(stdout="diff --git a/demo.py b/demo.py\n", stderr="", returncode=0)
+        with mock.patch.object(self.module, "run", return_value=fake_cp), mock.patch.object(
+            self.module,
+            "call_ollama",
+            return_value="SUMMARY: update demo behavior\nDETAILS:\n- changed demo.py",
+        ) as call_mock:
+            message = self.module.make_commit_message(
+                root=Path("."),
+                request="update demo behavior",
+                written=["demo.py"],
+                ollama_url="http://127.0.0.1:11434",
+                model="qwen3.5:latest",
+            )
+
+        self.assertTrue(message.startswith("update demo behavior"))
+        call_mock.assert_called_once_with(
+            mock.ANY,
+            "http://127.0.0.1:11434",
+            "qwen3.5:latest",
+            plan_mode=False,
+        )
+
+    def test_process_request_saves_summary_in_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            with mock.patch.object(
+                self.module,
+                "build_request_history_context",
+                return_value="",
+            ), mock.patch.object(
+                self.module,
+                "summarize_request_for_history",
+                return_value="sintesi breve",
+            ) as summary_mock, mock.patch.object(
+                self.module,
+                "append_request_history",
+            ) as append_mock, mock.patch.object(
+                self.module,
+                "collect_project_context",
+                return_value=("", self.module.ProjectContextStats()),
+            ), mock.patch.object(
+                self.module,
+                "apply_pass",
+                return_value=self.module.AppliedPassResult(
+                    response="NO_CHANGES",
+                    valid_response=True,
+                    no_changes=True,
+                    validation_ok=True,
+                    changed_files=[],
+                ),
+            ):
+                self.module.process_request(
+                    root=root,
+                    request="richiesta completa da riassumere",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    plan_mode=False,
+                    dry_run=False,
+                    auto_commit=False,
+                    five_pass_engine=False,
+                    auto_readme=False,
+                )
+
+            saved_last_request = (root / self.module.LAST_REQUEST_FILE).read_text(encoding="utf-8")
+            self.assertEqual(saved_last_request, "richiesta completa da riassumere\n")
+
+        summary_mock.assert_called_once_with(
+            "richiesta completa da riassumere",
+            "http://127.0.0.1:11434",
+            "test-model",
+        )
+        append_mock.assert_called_once_with(root, "sintesi breve")
+
+    def test_load_last_request_reads_saved_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.module.save_last_request(root, "esegui refactor parser")
+            loaded = self.module.load_last_request(root)
+
+        self.assertEqual(loaded, "esegui refactor parser")
+
+    def test_enforce_functional_guardrail_runs_fix_until_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            with mock.patch.object(
+                self.module,
+                "collect_project_context",
+                return_value=("", self.module.ProjectContextStats()),
+            ), mock.patch.object(
+                self.module,
+                "build_session_diff",
+                return_value="diff",
+            ), mock.patch.object(
+                self.module,
+                "call_ollama",
+                side_effect=[
+                    "VERDICT: FIX\nISSUES:\n- mismatch\nFIXES:\n- adjust\nFILES:\n- app.py",
+                    "VERDICT: OK\nISSUES:\n- none\nFIXES:\n- none\nFILES:\n- none",
+                ],
+            ), mock.patch.object(
+                self.module,
+                "apply_pass",
+                return_value=self.module.AppliedPassResult(
+                    response="===FILE: app.py===\nprint('ok')\n===END===\n",
+                    valid_response=True,
+                    validation_ok=True,
+                    changed_files=["app.py"],
+                ),
+            ) as apply_mock, mock.patch.object(
+                self.module,
+                "compute_changed_files",
+                return_value=["app.py"],
+            ):
+                ok, written = self.module.enforce_functional_guardrail(
+                    root=root,
+                    request="sistema endpoint",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    request_history="",
+                    backup={},
+                    written=["app.py"],
+                    plan_text="",
+                )
+
+        self.assertTrue(ok)
+        self.assertEqual(written, ["app.py"])
+        self.assertEqual(apply_mock.call_count, 1)
+
+    def test_enforce_functional_guardrail_rolls_back_when_unresolved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            with mock.patch.object(
+                self.module,
+                "collect_project_context",
+                return_value=("", self.module.ProjectContextStats()),
+            ), mock.patch.object(
+                self.module,
+                "build_session_diff",
+                return_value="diff",
+            ), mock.patch.object(
+                self.module,
+                "call_ollama",
+                return_value="VERDICT: FIX\nISSUES:\n- mismatch\nFIXES:\n- adjust\nFILES:\n- app.py",
+            ), mock.patch.object(
+                self.module,
+                "apply_pass",
+                return_value=self.module.AppliedPassResult(
+                    response="===FILE: app.py===\nprint('still wrong')\n===END===\n",
+                    valid_response=True,
+                    validation_ok=True,
+                    changed_files=["app.py"],
+                ),
+            ) as apply_mock, mock.patch.object(
+                self.module,
+                "compute_changed_files",
+                side_effect=[["app.py"], ["app.py"], []],
+            ), mock.patch.object(
+                self.module,
+                "restore_files",
+            ) as restore_mock:
+                ok, written = self.module.enforce_functional_guardrail(
+                    root=root,
+                    request="sistema endpoint",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    request_history="",
+                    backup={},
+                    written=["app.py"],
+                    plan_text="",
+                )
+
+        self.assertFalse(ok)
+        self.assertEqual(written, [])
+        self.assertEqual(apply_mock.call_count, self.module.FUNCTIONAL_GUARDRAIL_MAX_FIXES)
+        restore_mock.assert_called_once()
+
+    def test_main_does_not_save_config_on_startup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_config = self.module.build_runtime_config()
+            runtime_config["ollama_url"] = None
+
+            with mock.patch.object(self.module, "ensure_git_repo", return_value=root), mock.patch.object(
+                self.module,
+                "load_config",
+                return_value=runtime_config,
+            ), mock.patch.object(
+                self.module,
+                "setup_readline",
+            ), mock.patch.object(
+                self.module,
+                "show_model_status",
+            ), mock.patch.object(
+                self.module,
+                "prompt_input",
+                side_effect=EOFError,
+            ), mock.patch.object(
+                self.module,
+                "save_config",
+            ) as save_config_mock, mock.patch.object(
+                sys,
+                "argv",
+                ["ollama-code"],
+            ):
+                self.module.main()
+
+        save_config_mock.assert_not_called()
 
 
 if __name__ == "__main__":
