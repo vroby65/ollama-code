@@ -3297,6 +3297,15 @@ def main() -> None:
                 list_files(root)
             elif command == "/s":
                 run_shell_command(arg if arg else None)
+            elif command == "/ollama-url":
+                if arg:
+                    ollama_url = default_ollama_url(arg)
+                    config["ollama_url"] = ollama_url
+                    save_config(root, config)
+                    completer.ollama_url = ollama_url
+                    print(c(f"Ollama endpoint set to: {ollama_url}", GREEN))
+                else:
+                    print(c(f"Current Ollama endpoint: {ollama_url}", CYAN))                
             elif command == "/diff":
                 show_git_diff()
             elif command == "/model":
