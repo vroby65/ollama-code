@@ -120,7 +120,7 @@ OLLAMA_FALLBACK_MODELS = [
 SLASH_COMMANDS = [
     "/f",
     "/s",
-    "/ollama-url",
+    "/set-endpoint",
     "/diff",
     "/model",
     "/fallback-model",
@@ -139,7 +139,7 @@ SLASH_COMMANDS = [
 SLASH_COMMAND_DESCRIPTIONS = {
     "/f": "list files",
     "/s": "shell",
-    "/ollama-url": "set/show Ollama endpoint",
+    "/set-endpoint": "change Ollama endpoint",
     "/diff": "diff git",
     "/model": "change model",
     "/fallback-model": "change automatic fallback model",
@@ -1226,7 +1226,10 @@ def default_ollama_url(raw: str | None = None) -> str:
     if not value:
         value = "127.0.0.1:11434"
     if "://" not in value:
-        value = "http://" + value
+        parsed = urllib.parse.urlparse(f"//{value}")
+        host = (parsed.hostname or "").lower()
+        scheme = "https" if host == "ollama.com" or host.endswith(".ollama.com") else "http"
+        value = f"{scheme}://{value}"
     return value.rstrip("/")
 
 
@@ -1514,6 +1517,9 @@ def discover_ollama_models(ollama_url: str | None = None) -> list[str]:
     if models:
         return unique_preserve(models)
 
+    if is_ollama_cloud_url(url):
+        return []
+
     if tool_exists("ollama"):
         cp = run(["ollama", "list"], check=False, timeout=MODEL_DISCOVERY_TIMEOUT_SECONDS)
         if cp.returncode == 0:
@@ -1534,10 +1540,16 @@ def discover_model_choices(
     note: str | None = None
 
     if not discovered:
-        note = (
-            "Ollama is not responding or is not exposing installed models. "
-            "You can enter a model name manually or set OLLAMA_MODEL."
-        )
+        if is_ollama_cloud_url(ollama_url):
+            note = (
+                "No models discovered from the Ollama cloud endpoint. "
+                "Set OLLAMA_API_KEY and verify the endpoint."
+            )
+        else:
+            note = (
+                "Ollama is not responding or is not exposing installed models. "
+                "You can enter a model name manually or set OLLAMA_MODEL."
+            )
 
     combined = unique_preserve(
         discovered
@@ -3332,7 +3344,10 @@ def main() -> None:
         "--ollama-url",
         dest="ollama_url",
         default=None,
-        help="Custom Ollama endpoint (default: OLLAMA_HOST or http://127.0.0.1:11434)",
+        help=(
+            "Custom Ollama endpoint (supports http:// or https://; "
+            "default: OLLAMA_HOST or http://127.0.0.1:11434)"
+        ),
     )
     parser.add_argument(
         "--plan",
@@ -3425,15 +3440,56 @@ def main() -> None:
                 list_files(root)
             elif command == "/s":
                 run_shell_command(arg if arg else None)
-            elif command == "/ollama-url":
-                if arg:
-                    ollama_url = default_ollama_url(arg)
-                    config["ollama_url"] = ollama_url
-                    save_config(root, config)
-                    completer.ollama_url = ollama_url
-                    print(c(f"Ollama endpoint set to: {ollama_url}", GREEN))
+            elif command == "/set-endpoint":
+                print(c(f"Current Ollama endpoint: {ollama_url}", CYAN))
+                new_endpoint_raw = arg.strip()
+                if not new_endpoint_raw:
+                    new_endpoint_raw = prompt_input(
+                        "new-endpoint (empty = keep current)> ",
+                        YELLOW,
+                    ).strip()
+                if not new_endpoint_raw:
+                    print(c("Endpoint unchanged.", MUTED))
+                    continue
+
+                new_ollama_url = default_ollama_url(new_endpoint_raw)
+                if new_ollama_url == ollama_url:
+                    print(c("Endpoint unchanged.", MUTED))
+                    continue
+
+                ollama_url = new_ollama_url
+                model = None
+                fallback_model = None
+                set_configured_fallback_model(None)
+                config["ollama_url"] = ollama_url
+                config["model"] = None
+                config["fallback_model"] = None
+                save_config(root, config)
+                completer.ollama_url = ollama_url
+
+                print(c(f"Ollama endpoint set to: {ollama_url}", GREEN))
+                print(c("Model and fallback model reset to automatic.", MUTED))
+
+                discovered_models = discover_ollama_models(ollama_url)
+                if discovered_models:
+                    preview = ", ".join(discovered_models[:6])
+                    if len(discovered_models) > 6:
+                        preview += ", ..."
+                    print(
+                        c(
+                            f"Available models reloaded ({len(discovered_models)}): {preview}",
+                            MUTED,
+                        )
+                    )
                 else:
-                    print(c(f"Current Ollama endpoint: {ollama_url}", CYAN))                
+                    print(
+                        c(
+                            "Available models reloaded: none discovered "
+                            "(endpoint unreachable or no models exposed).",
+                            YELLOW,
+                        )
+                    )
+                show_model_status(model, ollama_url)
             elif command == "/diff":
                 show_git_diff()
             elif command == "/model":

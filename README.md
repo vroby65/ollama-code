@@ -113,7 +113,7 @@ If the current directory is not a Git repository, `ollama-code` initializes one 
 
 Available options:
 
-- `--ollama-url <url>`: set a custom Ollama endpoint. Default: `OLLAMA_HOST` or `http://127.0.0.1:11434`
+- `--ollama-url <url>`: set a custom Ollama endpoint (you can pass `http://` or `https://`). Default: `OLLAMA_HOST` or `http://127.0.0.1:11434` (auto-uses `https://` when host is `ollama.com`/`*.ollama.com` and no protocol is provided)
 - `--plan`: ask Ollama for a plan before generating code
 - `--dry-run`: show changes but restore the working tree afterward
 - `--no-commit`: disable automatic Git commits
@@ -129,7 +129,7 @@ Inside the prompt you can use:
 - `/f`: list project files
 - `/s`: open a shell command prompt
 - `/s <command>`: run a shell command directly
-- `/ollama-url [url]`: show or set the Ollama endpoint
+- `/set-endpoint`: show the current endpoint, prompt for a new one (empty input keeps current), reset model/fallback to automatic, and reload available models from the new endpoint
 - `/diff`: show Git diff
 - `/model`: choose an Ollama model interactively (same autocomplete menu as `/`, auto-open)
 - `/model <name|number|default>`: switch model
@@ -180,6 +180,8 @@ The Ollama endpoint can be configured with:
 
 - `--ollama-url`
 - `OLLAMA_HOST`
+
+If no protocol is specified, `ollama-code` uses `http://` for local endpoints and `https://` for `ollama.com` cloud endpoints.
 
 Optional test command override:
 

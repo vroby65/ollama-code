@@ -450,11 +450,74 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertTrue(loaded["five_pass_engine"])
         self.assertFalse(loaded["auto_readme"])
 
-    def test_slash_menu_includes_ollama_url_command(self):
-        self.assertIn("/ollama-url", self.module.SLASH_COMMANDS)
+    def test_default_ollama_url_keeps_explicit_protocol(self):
         self.assertEqual(
-            self.module.SLASH_COMMAND_DESCRIPTIONS.get("/ollama-url"),
-            "set/show Ollama endpoint",
+            self.module.default_ollama_url("https://ollama.com/api"),
+            "https://ollama.com/api",
+        )
+        self.assertEqual(
+            self.module.default_ollama_url("http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434",
+        )
+
+    def test_default_ollama_url_uses_https_for_cloud_host_without_protocol(self):
+        self.assertEqual(
+            self.module.default_ollama_url("ollama.com"),
+            "https://ollama.com",
+        )
+        self.assertEqual(
+            self.module.default_ollama_url("api.ollama.com/api"),
+            "https://api.ollama.com/api",
+        )
+
+    def test_discover_ollama_models_does_not_fallback_to_local_for_cloud_endpoint(self):
+        with mock.patch.object(
+            self.module,
+            "fetch_json",
+            return_value=None,
+        ), mock.patch.object(
+            self.module,
+            "tool_exists",
+            return_value=True,
+        ) as tool_exists_mock, mock.patch.object(
+            self.module,
+            "run",
+        ) as run_mock:
+            models = self.module.discover_ollama_models("https://ollama.com")
+
+        self.assertEqual(models, [])
+        tool_exists_mock.assert_not_called()
+        run_mock.assert_not_called()
+
+    def test_discover_ollama_models_falls_back_to_local_for_non_cloud_endpoint(self):
+        fake_cp = mock.Mock(
+            returncode=0,
+            stdout="NAME               ID           SIZE      MODIFIED\nqwen3.5:latest     abc123       4.7 GB    now\n",
+            stderr="",
+        )
+        with mock.patch.object(
+            self.module,
+            "fetch_json",
+            return_value=None,
+        ), mock.patch.object(
+            self.module,
+            "tool_exists",
+            return_value=True,
+        ), mock.patch.object(
+            self.module,
+            "run",
+            return_value=fake_cp,
+        ) as run_mock:
+            models = self.module.discover_ollama_models("http://127.0.0.1:11434")
+
+        self.assertEqual(models, ["qwen3.5:latest"])
+        run_mock.assert_called_once()
+
+    def test_slash_menu_includes_set_endpoint_command(self):
+        self.assertIn("/set-endpoint", self.module.SLASH_COMMANDS)
+        self.assertEqual(
+            self.module.SLASH_COMMAND_DESCRIPTIONS.get("/set-endpoint"),
+            "change Ollama endpoint",
         )
 
     def test_slash_menu_includes_model_fallback_alias(self):
@@ -881,6 +944,86 @@ class OllamaCodeTests(unittest.TestCase):
             ):
                 self.module.main()
 
+        save_config_mock.assert_not_called()
+
+    def test_main_set_endpoint_reloads_models_and_resets_model_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_config = self.module.build_runtime_config()
+            runtime_config["model"] = "old-model:latest"
+            runtime_config["fallback_model"] = "old-fallback:latest"
+
+            with mock.patch.object(self.module, "ensure_git_repo", return_value=root), mock.patch.object(
+                self.module,
+                "load_config",
+                return_value=runtime_config,
+            ), mock.patch.object(
+                self.module,
+                "setup_readline",
+            ), mock.patch.object(
+                self.module,
+                "show_model_status",
+            ) as show_model_status_mock, mock.patch.object(
+                self.module,
+                "discover_ollama_models",
+                return_value=["qwen3.5:latest"],
+            ) as discover_models_mock, mock.patch.object(
+                self.module,
+                "prompt_input",
+                side_effect=["/set-endpoint", "https://ollama.com", EOFError],
+            ), mock.patch.object(
+                self.module,
+                "save_config",
+            ) as save_config_mock, mock.patch.object(
+                sys,
+                "argv",
+                ["ollama-code"],
+            ):
+                self.module.main()
+
+        discover_models_mock.assert_called_once_with("https://ollama.com")
+        save_config_mock.assert_called_once()
+        saved_config = save_config_mock.call_args.args[1]
+        self.assertEqual(saved_config["ollama_url"], "https://ollama.com")
+        self.assertIsNone(saved_config["model"])
+        self.assertIsNone(saved_config["fallback_model"])
+        self.assertGreaterEqual(show_model_status_mock.call_count, 2)
+        self.assertEqual(show_model_status_mock.call_args_list[-1], mock.call(None, "https://ollama.com"))
+
+    def test_main_set_endpoint_keeps_current_when_input_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_config = self.module.build_runtime_config()
+            runtime_config["ollama_url"] = "http://127.0.0.1:11434"
+
+            with mock.patch.object(self.module, "ensure_git_repo", return_value=root), mock.patch.object(
+                self.module,
+                "load_config",
+                return_value=runtime_config,
+            ), mock.patch.object(
+                self.module,
+                "setup_readline",
+            ), mock.patch.object(
+                self.module,
+                "show_model_status",
+            ), mock.patch.object(
+                self.module,
+                "discover_ollama_models",
+            ) as discover_models_mock, mock.patch.object(
+                self.module,
+                "prompt_input",
+                side_effect=["/set-endpoint", "", EOFError],
+            ), mock.patch.object(
+                self.module,
+                "save_config",
+            ) as save_config_mock, mock.patch.object(
+                sys,
+                "argv",
+                ["ollama-code"],
+            ):
+                self.module.main()
+
+        discover_models_mock.assert_not_called()
         save_config_mock.assert_not_called()
 
 
