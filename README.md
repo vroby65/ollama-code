@@ -13,11 +13,12 @@ The project is intentionally simple: it is a single Python script designed for l
 - Supports automatic planning before code generation.
 - Supports dry-run mode to preview changes without keeping them.
 - Can automatically commit generated changes with Git.
-- Includes an optional multi-pass workflow with draft, review, fix, and polish steps.
+- Uses a single adaptive workflow with a `main_model` for code changes and a `review_model` for ratification.
 - Uses English as the default CLI and prompt language.
 - Keeps auto-generated `README.md` instruction sections in English.
 - Shows cloud-model usage in the interactive prompt status bar when `prompt_toolkit` is available, using per-request compute-time metrics returned by Ollama.
 - Automatically creates/updates `README.md` instructions for generated code changes.
+- Inspects Ollama model metadata to estimate a safe prompt budget and keep project context within the active model limit.
 - Validates modified files before keeping changes:
   - Python via `python3 -m py_compile`
   - JavaScript via `node --check`
@@ -26,10 +27,10 @@ The project is intentionally simple: it is a single Python script designed for l
 - Runs project tests automatically when a runner is detected:
   - Python projects: `python3 -m pytest -q` (or `unittest` fallback)
   - Node projects: `pnpm test`, `npm test`, or `yarn test`
-- If validation/tests fail, reports the failure and runs a corrective pass.
+- If validation/tests or review ratification fail, reports the failure and retries with explicit feedback.
 - Stores request summaries in history and the last raw model response for debugging and retries.
 - Summarizes each new request with the active model, prints the summary, and saves that summary in history.
-- Runs a functional guardrail review after generation; if it finds gaps, it runs targeted fix passes and rolls back if unresolved.
+- Rolls back changes only if the unified workflow cannot converge within the allowed attempts.
 
 ## Requirements
 
@@ -117,10 +118,7 @@ Available options:
 - `--plan`: ask Ollama for a plan before generating code
 - `--dry-run`: show changes but restore the working tree afterward
 - `--no-commit`: disable automatic Git commits
-- `--no-engine`: disable the five-pass engine
 - `--no-readme`: disable automatic `README.md` instruction generation
-
-The five-pass engine is currently optional and can also be enabled during a session with `/engine on`.
 
 ## Interactive Commands
 
@@ -129,17 +127,16 @@ Inside the prompt you can use:
 - `/f`: list project files
 - `/s`: open a shell command prompt
 - `/s <command>`: run a shell command directly
-- `/set-endpoint`: show the current endpoint, prompt for a new one (empty input keeps current), reset model/fallback to automatic, and reload available models from the new endpoint
+- `/set-endpoint`: show the current endpoint, prompt for a new one (empty input keeps current), reset `main_model`/`review_model` to automatic, and reload available models from the new endpoint
 - `/diff`: show Git diff
-- `/model`: choose an Ollama model interactively (same autocomplete menu as `/`, auto-open)
-- `/model <name|number|default>`: switch model
-- `/fallback-model`: choose the automatic fallback model interactively (same autocomplete menu as `/`, auto-open)
-- `/model-fallback`: alias for `/fallback-model`
-- `/fallback-model <name|number|default>`: switch/reset automatic fallback model
+- `/mainmodel`: choose the main Ollama model interactively (same autocomplete menu as `/`, auto-open)
+- `/mainmodel <name|number|default>`: switch/reset the main model
+- `/model`: alias for `/mainmodel`
+- `/review-model`: choose the review model interactively (same autocomplete menu as `/`, auto-open)
+- `/review-model <name|number|default>`: switch/reset the review model
 - `/plan [on|off]`: set planning mode (interactive selector if omitted)
 - `/dry [on|off]`: set dry-run mode (interactive selector if omitted)
 - `/commit [on|off]`: set automatic commit mode (interactive selector if omitted)
-- `/engine [on|off]`: set five-pass engine mode (interactive selector if omitted)
 - `/readme [on|off]`: set automatic `README.md` instruction generation (interactive selector if omitted)
 - `/retry`: repeat the last request
 - `/last`: show the last saved raw response
@@ -156,15 +153,18 @@ If you point the tool directly at `https://ollama.com/api`, set `OLLAMA_API_KEY`
 
 `ollama-code` scans the current repository, skips internal state files, excluded directories, backup folders, binary files, symlinks, and oversized files, then builds a prompt from the remaining text files.
 
-The model answers with unified diff patch blocks in a strict format. The tool applies those patches, validates changed files, runs tests when available, restores the previous state automatically if checks fail, and updates `README.md` instructions for successful generated changes.
+Before each generation or review pass, the tool asks Ollama for model details and derives a conservative prompt budget from the active context window. It then truncates project context to stay within that budget.
 
-When enabled, the multi-pass engine runs this flow:
+The main model answers with unified diff patch blocks in a strict format. The tool applies those patches, validates changed files, runs tests when available, asks the review model to ratify the resulting diff, and retries with explicit validation/review feedback when needed.
 
-1. Plan
-2. Draft
-3. Review
-4. Fix
-5. Polish
+The workflow is:
+
+1. Optional plan with `main_model`
+2. Code generation/fix pass with `main_model`
+3. Validation and test execution
+4. Diff review and ratification with `review_model`
+5. Retry from the current state if validation or review fails
+6. Roll back only if the workflow cannot converge
 
 ## Configuration
 
@@ -172,9 +172,8 @@ Model selection can come from:
 
 1. The current session
 2. `OLLAMA_MODEL`
-3. A configured fallback model (`/fallback-model`)
-4. Automatic discovery of installed Ollama models
-5. Built-in fallback model choices
+3. Automatic discovery of installed Ollama models
+4. Built-in preferred model choices
 
 The Ollama endpoint can be configured with:
 
@@ -195,13 +194,12 @@ User configuration is stored in:
 
 Saved settings include:
 
-- `model`
-- `fallback_model`
+- `main_model`
+- `review_model`
 - `ollama_url`
 - `plan_mode`
 - `dry_run`
 - `auto_commit`
-- `five_pass_engine`
 - `auto_readme`
 
 Interactive prompt history is stored in:
@@ -221,7 +219,7 @@ Project/session state files include:
 ## Safety Notes
 
 - The tool refuses absolute paths, parent-directory traversal, `.git` paths, and its own internal state files.
-- Invalid generated code is rolled back automatically when validation/tests fail.
+- Invalid generated code is retried from validation/review feedback and rolled back only if retries do not converge.
 - Dry-run mode restores the original files after showing the changes.
 - Automatic commits only include files written by the tool, excluding internal state files.
 

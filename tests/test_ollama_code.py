@@ -62,71 +62,84 @@ class OllamaCodeTests(unittest.TestCase):
 
         self.assertEqual(stats.truncated_files, ["big.py"])
 
-    def test_run_five_pass_engine_runs_only_three_apply_passes(self):
+    def test_resolve_model_context_info_prefers_running_context(self):
+        with mock.patch.object(
+            self.module,
+            "resolve_active_model",
+            return_value="test-model",
+        ), mock.patch.object(
+            self.module,
+            "discover_running_model_context_length",
+            return_value=8192,
+        ), mock.patch.object(
+            self.module,
+            "fetch_model_details",
+            return_value={
+                "parameters": "num_ctx 2048",
+                "model_info": {"llama.context_length": 131072},
+            },
+        ):
+            info = self.module.resolve_model_context_info("test-model", "http://127.0.0.1:11434")
+
+        self.assertEqual(info.model, "test-model")
+        self.assertEqual(info.context_window_tokens, 8192)
+        self.assertEqual(info.max_context_tokens, 131072)
+        self.assertEqual(info.source, "api-ps")
+        self.assertGreater(info.prompt_budget_chars, 0)
+
+    def test_run_review_workflow_retries_until_review_ok(self):
         apply_calls = []
 
         def fake_apply_pass(**kwargs):
             apply_calls.append(kwargs)
-            idx = len(apply_calls)
-
-            if idx == 1:
-                return self.module.AppliedPassResult(
-                    response="draft",
-                    valid_response=True,
-                    written=["main.py"],
-                    changed_files=["main.py"],
-                    validation_ok=True,
-                )
-
-            if idx == 2:
-                return self.module.AppliedPassResult(
-                    response="fix",
-                    valid_response=True,
-                    written=[],
-                    changed_files=[],
-                    validation_ok=True,
-                    no_changes=True,
-                )
-
             return self.module.AppliedPassResult(
-                response="polish",
+                response="draft",
                 valid_response=True,
-                written=[],
-                changed_files=[],
+                written=["main.py"],
+                changed_files=["main.py"],
                 validation_ok=True,
-                no_changes=True,
             )
 
-        def fake_call_ollama(prompt, ollama_url, model, plan_mode=False):
-            if plan_mode:
-                return "PLAN:\n- objective"
-            return "VERDICT: OK\nISSUES:\n- none\nFIXES:\n- none\nFILES:\n- none"
+        context_info = self.module.ModelContextInfo(
+            model="test-model",
+            context_window_tokens=8192,
+            prompt_budget_chars=24000,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with mock.patch.object(self.module, "apply_pass", side_effect=fake_apply_pass), mock.patch.object(
-                self.module, "call_ollama", side_effect=fake_call_ollama
+                self.module,
+                "call_ollama",
+                side_effect=[
+                    "VERDICT: FIX\nISSUES:\n- edge case missing\nFIXES:\n- handle edge case\nFILES:\n- main.py",
+                    "VERDICT: OK\nISSUES:\n- none\nFIXES:\n- none\nFILES:\n- none",
+                ],
             ), mock.patch.object(
                 self.module,
-                "collect_project_context",
-                return_value=("", self.module.ProjectContextStats()),
+                "collect_context_for_prompt",
+                return_value=("", self.module.ProjectContextStats(), context_info),
             ), mock.patch.object(
-                self.module, "build_session_diff", return_value=""
+                self.module,
+                "compute_changed_files",
+                return_value=["main.py"],
             ):
-                ok, written = self.module.run_five_pass_engine(
+                ok, written, plan_text = self.module.run_review_workflow(
                     root=root,
-                    project_text="",
                     request="make a small change",
                     ollama_url="http://127.0.0.1:11434",
-                    model="test-model",
+                    main_model="main-model",
+                    review_model="review-model",
                     request_history="",
+                    plan_mode=False,
                     backup={},
                 )
 
         self.assertTrue(ok)
         self.assertEqual(written, ["main.py"])
-        self.assertEqual(len(apply_calls), 3)
-        self.assertEqual(apply_calls[0]["plan_text"], "PLAN:\n- objective")
+        self.assertEqual(plan_text, "")
+        self.assertEqual(len(apply_calls), 2)
+        self.assertEqual(apply_calls[1]["review_text"], "VERDICT: FIX\nISSUES:\n- edge case missing\nFIXES:\n- handle edge case\nFILES:\n- main.py")
 
     def test_apply_pass_rolls_back_when_project_tests_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -402,7 +415,7 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertEqual(updated.count(self.module.GENERATED_README_START), 1)
         self.assertEqual(updated.count(self.module.GENERATED_README_END), 1)
 
-    def test_load_config_file_reads_fallback_model(self):
+    def test_load_config_file_migrates_legacy_model_fields(self):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / ".ollama-code"
             config_path.write_text(
@@ -418,8 +431,8 @@ class OllamaCodeTests(unittest.TestCase):
             loaded = self.module.load_config_file(config_path)
 
         self.assertIsNotNone(loaded)
-        self.assertEqual(loaded["model"], "qwen2.5-coder:latest")
-        self.assertEqual(loaded["fallback_model"], "mistral:latest")
+        self.assertEqual(loaded["main_model"], "qwen2.5-coder:latest")
+        self.assertEqual(loaded["review_model"], "mistral:latest")
 
     def test_load_config_file_reads_runtime_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -427,13 +440,12 @@ class OllamaCodeTests(unittest.TestCase):
             config_path.write_text(
                 json.dumps(
                     {
-                        "model": "qwen2.5-coder:latest",
-                        "fallback_model": "mistral:latest",
+                        "main_model": "qwen2.5-coder:latest",
+                        "review_model": "mistral:latest",
                         "ollama_url": "127.0.0.1:11434",
                         "plan_mode": True,
                         "dry_run": "true",
                         "auto_commit": "false",
-                        "five_pass_engine": 1,
                         "auto_readme": 0,
                     }
                 ),
@@ -447,7 +459,6 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertTrue(loaded["plan_mode"])
         self.assertTrue(loaded["dry_run"])
         self.assertFalse(loaded["auto_commit"])
-        self.assertTrue(loaded["five_pass_engine"])
         self.assertFalse(loaded["auto_readme"])
 
     def test_default_ollama_url_keeps_explicit_protocol(self):
@@ -520,11 +531,11 @@ class OllamaCodeTests(unittest.TestCase):
             "change Ollama endpoint",
         )
 
-    def test_slash_menu_includes_model_fallback_alias(self):
-        self.assertIn("/model-fallback", self.module.SLASH_COMMANDS)
+    def test_slash_menu_includes_review_model_command(self):
+        self.assertIn("/review-model", self.module.SLASH_COMMANDS)
         self.assertEqual(
-            self.module.SLASH_COMMAND_DESCRIPTIONS.get("/model-fallback"),
-            "alias for /fallback-model",
+            self.module.SLASH_COMMAND_DESCRIPTIONS.get("/review-model"),
+            "change review model",
         )
 
     def test_model_completion_offers_choices_without_trailing_space(self):
@@ -533,7 +544,7 @@ class OllamaCodeTests(unittest.TestCase):
 
         config = self.module.build_runtime_config()
         completer = self.module.SlashCommandCompleter(config, "http://127.0.0.1:11434")
-        document = type("Doc", (), {"text_before_cursor": "/model"})()
+        document = type("Doc", (), {"text_before_cursor": "/mainmodel"})()
 
         with mock.patch.object(
             self.module,
@@ -546,13 +557,13 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertIn(" default", texts)
         self.assertIn(" qwen3.5:latest", texts)
 
-    def test_fallback_model_completion_offers_choices_without_trailing_space(self):
+    def test_review_model_completion_offers_choices_without_trailing_space(self):
         if self.module.Completion is None:
             self.skipTest("prompt_toolkit Completion unavailable")
 
         config = self.module.build_runtime_config()
         completer = self.module.SlashCommandCompleter(config, "http://127.0.0.1:11434")
-        document = type("Doc", (), {"text_before_cursor": "/fallback-model"})()
+        document = type("Doc", (), {"text_before_cursor": "/review-model"})()
 
         with mock.patch.object(
             self.module,
@@ -565,13 +576,13 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertIn(" default", texts)
         self.assertIn(" mistral:latest", texts)
 
-    def test_model_fallback_alias_completion_offers_choices_without_trailing_space(self):
+    def test_model_alias_completion_offers_choices_without_trailing_space(self):
         if self.module.Completion is None:
             self.skipTest("prompt_toolkit Completion unavailable")
 
         config = self.module.build_runtime_config()
         completer = self.module.SlashCommandCompleter(config, "http://127.0.0.1:11434")
-        document = type("Doc", (), {"text_before_cursor": "/model-fallback"})()
+        document = type("Doc", (), {"text_before_cursor": "/model"})()
 
         with mock.patch.object(
             self.module,
@@ -680,13 +691,12 @@ class OllamaCodeTests(unittest.TestCase):
                 self.module.save_config(
                     fake_home,
                     {
-                        "model": "qwen2.5-coder:latest",
-                        "fallback_model": "mistral:latest",
+                        "main_model": "qwen2.5-coder:latest",
+                        "review_model": "mistral:latest",
                         "ollama_url": "http://127.0.0.1:11434",
                         "plan_mode": True,
                         "dry_run": True,
                         "auto_commit": False,
-                        "five_pass_engine": True,
                         "auto_readme": False,
                     },
                 )
@@ -695,19 +705,17 @@ class OllamaCodeTests(unittest.TestCase):
             self.assertTrue(saved_path.exists())
             saved = json.loads(saved_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(saved["model"], "qwen2.5-coder:latest")
-        self.assertEqual(saved["fallback_model"], "mistral:latest")
+        self.assertEqual(saved["main_model"], "qwen2.5-coder:latest")
+        self.assertEqual(saved["review_model"], "mistral:latest")
         self.assertEqual(saved["ollama_url"], "http://127.0.0.1:11434")
         self.assertTrue(saved["plan_mode"])
         self.assertTrue(saved["dry_run"])
         self.assertFalse(saved["auto_commit"])
-        self.assertTrue(saved["five_pass_engine"])
         self.assertFalse(saved["auto_readme"])
 
-    def test_pick_auto_model_prefers_configured_fallback(self):
-        self.module.set_configured_fallback_model("custom-fallback:latest")
+    def test_pick_auto_model_prefers_preferred_local_models(self):
         selected = self.module.pick_auto_model(["qwen3.5:latest", "mistral:latest"])
-        self.assertEqual(selected, "custom-fallback:latest")
+        self.assertEqual(selected, "qwen3.5:latest")
 
     def test_summarize_request_for_history_uses_model_response(self):
         with mock.patch.object(
@@ -774,28 +782,18 @@ class OllamaCodeTests(unittest.TestCase):
                 "append_request_history",
             ) as append_mock, mock.patch.object(
                 self.module,
-                "collect_project_context",
-                return_value=("", self.module.ProjectContextStats()),
-            ), mock.patch.object(
-                self.module,
-                "apply_pass",
-                return_value=self.module.AppliedPassResult(
-                    response="NO_CHANGES",
-                    valid_response=True,
-                    no_changes=True,
-                    validation_ok=True,
-                    changed_files=[],
-                ),
+                "run_review_workflow",
+                return_value=(True, [], ""),
             ):
                 self.module.process_request(
                     root=root,
                     request="richiesta completa da riassumere",
                     ollama_url="http://127.0.0.1:11434",
-                    model="test-model",
+                    main_model="test-model",
+                    review_model="review-model",
                     plan_mode=False,
                     dry_run=False,
                     auto_commit=False,
-                    five_pass_engine=False,
                     auto_readme=False,
                 )
 
@@ -817,25 +815,23 @@ class OllamaCodeTests(unittest.TestCase):
 
         self.assertEqual(loaded, "esegui refactor parser")
 
-    def test_enforce_functional_guardrail_runs_fix_until_ok(self):
+    def test_run_review_workflow_rolls_back_when_unresolved(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            context_info = self.module.ModelContextInfo(
+                model="test-model",
+                context_window_tokens=8192,
+                prompt_budget_chars=24000,
+            )
 
             with mock.patch.object(
                 self.module,
-                "collect_project_context",
-                return_value=("", self.module.ProjectContextStats()),
-            ), mock.patch.object(
-                self.module,
-                "build_session_diff",
-                return_value="diff",
+                "collect_context_for_prompt",
+                return_value=("", self.module.ProjectContextStats(), context_info),
             ), mock.patch.object(
                 self.module,
                 "call_ollama",
-                side_effect=[
-                    "VERDICT: FIX\nISSUES:\n- mismatch\nFIXES:\n- adjust\nFILES:\n- app.py",
-                    "VERDICT: OK\nISSUES:\n- none\nFIXES:\n- none\nFILES:\n- none",
-                ],
+                return_value="VERDICT: FIX\nISSUES:\n- mismatch\nFIXES:\n- adjust\nFILES:\n- app.py",
             ), mock.patch.object(
                 self.module,
                 "apply_pass",
@@ -848,70 +844,25 @@ class OllamaCodeTests(unittest.TestCase):
             ) as apply_mock, mock.patch.object(
                 self.module,
                 "compute_changed_files",
-                return_value=["app.py"],
-            ):
-                ok, written = self.module.enforce_functional_guardrail(
-                    root=root,
-                    request="sistema endpoint",
-                    ollama_url="http://127.0.0.1:11434",
-                    model="test-model",
-                    request_history="",
-                    backup={},
-                    written=["app.py"],
-                    plan_text="",
-                )
-
-        self.assertTrue(ok)
-        self.assertEqual(written, ["app.py"])
-        self.assertEqual(apply_mock.call_count, 1)
-
-    def test_enforce_functional_guardrail_rolls_back_when_unresolved(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-
-            with mock.patch.object(
-                self.module,
-                "collect_project_context",
-                return_value=("", self.module.ProjectContextStats()),
-            ), mock.patch.object(
-                self.module,
-                "build_session_diff",
-                return_value="diff",
-            ), mock.patch.object(
-                self.module,
-                "call_ollama",
-                return_value="VERDICT: FIX\nISSUES:\n- mismatch\nFIXES:\n- adjust\nFILES:\n- app.py",
-            ), mock.patch.object(
-                self.module,
-                "apply_pass",
-                return_value=self.module.AppliedPassResult(
-                    response="===FILE: app.py===\nprint('still wrong')\n===END===\n",
-                    valid_response=True,
-                    validation_ok=True,
-                    changed_files=["app.py"],
-                ),
-            ) as apply_mock, mock.patch.object(
-                self.module,
-                "compute_changed_files",
-                side_effect=[["app.py"], ["app.py"], []],
+                side_effect=[["app.py"]] * (self.module.WORKFLOW_MAX_ATTEMPTS * 3) + [[]],
             ), mock.patch.object(
                 self.module,
                 "restore_files",
             ) as restore_mock:
-                ok, written = self.module.enforce_functional_guardrail(
+                ok, written, _ = self.module.run_review_workflow(
                     root=root,
                     request="sistema endpoint",
                     ollama_url="http://127.0.0.1:11434",
-                    model="test-model",
+                    main_model="main-model",
+                    review_model="review-model",
                     request_history="",
+                    plan_mode=False,
                     backup={},
-                    written=["app.py"],
-                    plan_text="",
                 )
 
         self.assertFalse(ok)
         self.assertEqual(written, [])
-        self.assertEqual(apply_mock.call_count, self.module.FUNCTIONAL_GUARDRAIL_MAX_FIXES)
+        self.assertEqual(apply_mock.call_count, self.module.WORKFLOW_MAX_ATTEMPTS)
         restore_mock.assert_called_once()
 
     def test_main_does_not_save_config_on_startup(self):
@@ -950,8 +901,8 @@ class OllamaCodeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             runtime_config = self.module.build_runtime_config()
-            runtime_config["model"] = "old-model:latest"
-            runtime_config["fallback_model"] = "old-fallback:latest"
+            runtime_config["main_model"] = "old-model:latest"
+            runtime_config["review_model"] = "old-review:latest"
 
             with mock.patch.object(self.module, "ensure_git_repo", return_value=root), mock.patch.object(
                 self.module,
@@ -985,10 +936,10 @@ class OllamaCodeTests(unittest.TestCase):
         save_config_mock.assert_called_once()
         saved_config = save_config_mock.call_args.args[1]
         self.assertEqual(saved_config["ollama_url"], "https://ollama.com")
-        self.assertIsNone(saved_config["model"])
-        self.assertIsNone(saved_config["fallback_model"])
+        self.assertIsNone(saved_config["main_model"])
+        self.assertIsNone(saved_config["review_model"])
         self.assertGreaterEqual(show_model_status_mock.call_count, 2)
-        self.assertEqual(show_model_status_mock.call_args_list[-1], mock.call(None, "https://ollama.com"))
+        self.assertEqual(show_model_status_mock.call_args_list[-1], mock.call(None, None, "https://ollama.com"))
 
     def test_main_set_endpoint_keeps_current_when_input_is_empty(self):
         with tempfile.TemporaryDirectory() as tmp:

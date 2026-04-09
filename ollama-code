@@ -50,6 +50,10 @@ MAX_SUMMARY_DIFF_CHARS = 50000
 MODEL_DISCOVERY_TIMEOUT_SECONDS = 10
 TEST_RUN_TIMEOUT_SECONDS = 300
 MAX_TEST_OUTPUT_CHARS = 12000
+DEFAULT_CONTEXT_WINDOW_TOKENS = 4096
+APPROX_CHARS_PER_TOKEN = 4
+PROMPT_CONTEXT_USAGE_RATIO = 0.85
+MIN_PROJECT_CONTEXT_CHARS = 4000
 
 USER_STATE_DIR = ".ollama-code"
 USER_CONFIG_FILE = "config.json"
@@ -70,14 +74,13 @@ LEGACY_READLINE_HISTORY_FILES = (".ollama-history", ".ollama_code_history")
 OLLAMA_MAX_ATTEMPTS = 3
 OLLAMA_RETRY_DELAY_SECONDS = 2
 OLLAMA_TIMEOUT_SECONDS = 180
-FUNCTIONAL_GUARDRAIL_MAX_FIXES = 2
+WORKFLOW_MAX_ATTEMPTS = 4
 
-DEFAULT_MODEL = None
-DEFAULT_FALLBACK_MODEL = None
+DEFAULT_MAIN_MODEL = None
+DEFAULT_REVIEW_MODEL = None
 DEFAULT_PLAN_MODE = False
 DEFAULT_DRY_RUN = False
 DEFAULT_AUTO_COMMIT = True
-DEFAULT_FIVE_PASS_ENGINE = False
 DEFAULT_AUTO_README = True
 DEFAULT_SHOW_DIFF = True
 
@@ -111,7 +114,7 @@ INTERNAL_STATE_FILES = {
     LEGACY_REQUEST_HISTORY_FILE,
 }
 
-OLLAMA_FALLBACK_MODELS = [
+OLLAMA_PREFERRED_MODELS = [
     "qwen3.5:latest",
     "qwen2.5-coder:latest",
     "mistral:latest",
@@ -122,13 +125,12 @@ SLASH_COMMANDS = [
     "/s",
     "/set-endpoint",
     "/diff",
+    "/mainmodel",
+    "/review-model",
     "/model",
-    "/fallback-model",
-    "/model-fallback",
     "/plan",
     "/dry",
     "/commit",
-    "/engine",
     "/readme",
     "/retry",
     "/last",
@@ -141,13 +143,12 @@ SLASH_COMMAND_DESCRIPTIONS = {
     "/s": "shell",
     "/set-endpoint": "change Ollama endpoint",
     "/diff": "diff git",
-    "/model": "change model",
-    "/fallback-model": "change automatic fallback model",
-    "/model-fallback": "alias for /fallback-model",
+    "/mainmodel": "change main model",
+    "/review-model": "change review model",
+    "/model": "alias for /mainmodel",
     "/plan": "toggle planning",
     "/dry": "toggle dry-run",
     "/commit": "toggle commit",
-    "/engine": "toggle 5-pass engine",
     "/readme": "toggle readme instructions",
     "/retry": "repeat last request",
     "/last": "show last response",
@@ -155,10 +156,9 @@ SLASH_COMMAND_DESCRIPTIONS = {
     "/q": "quit",
 }
 
-SLASH_TOGGLE_COMMANDS = {"/plan", "/dry", "/commit", "/engine", "/readme"}
+SLASH_TOGGLE_COMMANDS = {"/plan", "/dry", "/commit", "/readme"}
 
 _PROMPT_SESSION = None
-_CONFIGURED_FALLBACK_MODEL: str | None = DEFAULT_FALLBACK_MODEL
 
 ConfigValue = str | bool | None
 
@@ -237,6 +237,16 @@ class AppliedPassResult:
     test_failures: list[str] = field(default_factory=list)
     no_changes: bool = False
     valid_response: bool = True
+    retry_feedback: str = ""
+
+
+@dataclass
+class ModelContextInfo:
+    model: str = ""
+    context_window_tokens: int = DEFAULT_CONTEXT_WINDOW_TOKENS
+    max_context_tokens: int | None = None
+    source: str = "default"
+    prompt_budget_chars: int = MAX_PROMPT_CHARS
 
 
 @dataclass
@@ -364,7 +374,7 @@ class SlashCommandCompleter(Completer):
         complete_model_without_trailing_space = (
             len(parts) == 1
             and not has_trailing_space
-            and prefix in {"/model", "/fallback-model", "/model-fallback"}
+            and prefix in {"/mainmodel", "/review-model", "/model"}
         )
 
         if len(parts) <= 1 and not has_trailing_space and not complete_model_without_trailing_space:
@@ -394,8 +404,8 @@ class SlashCommandCompleter(Completer):
                     yield Completion(option, start_position=-len(current_arg))
             return
 
-        if command in {"/model", "/fallback-model", "/model-fallback"}:
-            config_key = "model" if command == "/model" else "fallback_model"
+        if command in {"/mainmodel", "/review-model", "/model"}:
+            config_key = "review_model" if command == "/review-model" else "main_model"
             current_model = normalize_model_value(self.config.get(config_key))
             discovered_models, _, _ = discover_model_choices(self.ollama_url, current_model)
             default_model = default_model_choice()
@@ -404,7 +414,7 @@ class SlashCommandCompleter(Completer):
                 + ([current_model] if current_model else [])
                 + ([default_model] if default_model else [])
                 + discovered_models
-                + OLLAMA_FALLBACK_MODELS
+                + OLLAMA_PREFERRED_MODELS
             )
             for model_name in model_choices:
                 if model_name.lower().startswith(current_arg_lower):
@@ -845,7 +855,7 @@ def scan_project_files(root: Path) -> tuple[list[Path], dict[str, int], dict[str
     return sorted(files, key=lambda p: str(p.relative_to(root))), skipped_counts, skipped_examples
 
 
-def collect_project_context(root: Path) -> tuple[str, ProjectContextStats]:
+def collect_project_context(root: Path, max_chars: int | None = None) -> tuple[str, ProjectContextStats]:
     chunks = []
     total = 0
     files, skipped_counts, skipped_examples = scan_project_files(root)
@@ -853,14 +863,15 @@ def collect_project_context(root: Path) -> tuple[str, ProjectContextStats]:
         skipped_counts=skipped_counts,
         skipped_examples=skipped_examples,
     )
+    context_limit = MAX_PROMPT_CHARS if max_chars is None else max(0, min(MAX_PROMPT_CHARS, max_chars))
 
     for path in files:
         rel = str(path.relative_to(root))
         content, truncated = read_file_safely(path)
         chunk = f"===FILE: {rel}===\n{content}\n===END===\n\n"
 
-        if total + len(chunk) > MAX_PROMPT_CHARS:
-            remaining = MAX_PROMPT_CHARS - total
+        if total + len(chunk) > context_limit:
+            remaining = context_limit - total
             if remaining > 200:
                 chunk = chunk[:remaining] + "\n...[CONTEXT TRUNCATED]...\n"
                 chunks.append(chunk)
@@ -1018,12 +1029,33 @@ def preview_text(text: str, max_chars: int = 280) -> str:
     return normalized[:max_chars].rstrip() + "..."
 
 
-def show_context_summary(stats: ProjectContextStats) -> None:
+def format_context_source(source: str) -> str:
+    mapping = {
+        "api-ps": "running model context",
+        "api-show-parameters": "model parameters",
+        "api-show-model-info": "model metadata",
+        "default": "default Ollama context",
+    }
+    return mapping.get(source, source)
+
+
+def show_context_summary(stats: ProjectContextStats, context_info: ModelContextInfo | None = None) -> None:
     included = len(stats.included_files)
     print(c(
         f"Project context ready: {included} files included, {format_count(stats.total_chars)} characters.",
         CYAN,
     ))
+
+    if context_info is not None and context_info.model:
+        print(c(
+            (
+                f"Prompt budget for {context_info.model}: about "
+                f"{format_count(context_info.prompt_budget_chars)} characters "
+                f"from {format_count(context_info.context_window_tokens)} context tokens "
+                f"({format_context_source(context_info.source)})."
+            ),
+            MUTED,
+        ))
 
     if stats.included_files:
         print(c(f"Included files: {summarize_items(stats.included_files, max_items=6)}", MUTED))
@@ -1044,21 +1076,23 @@ def show_context_summary(stats: ProjectContextStats) -> None:
             print(c(f"Skipped {count} {label}.", MUTED))
 
     if stats.context_truncated:
+        limit = MAX_PROMPT_CHARS
+        if context_info is not None:
+            limit = min(MAX_PROMPT_CHARS, context_info.prompt_budget_chars)
         print(c(
-            f"Total context truncated to about {format_count(MAX_PROMPT_CHARS)} characters.",
+            f"Total context truncated to about {format_count(limit)} characters.",
             YELLOW,
         ))
 
 
 def build_runtime_config() -> dict[str, ConfigValue]:
     return {
-        "model": DEFAULT_MODEL,
-        "fallback_model": DEFAULT_FALLBACK_MODEL,
+        "main_model": DEFAULT_MAIN_MODEL,
+        "review_model": DEFAULT_REVIEW_MODEL,
         "ollama_url": None,
         "plan_mode": DEFAULT_PLAN_MODE,
         "dry_run": DEFAULT_DRY_RUN,
         "auto_commit": DEFAULT_AUTO_COMMIT,
-        "five_pass_engine": DEFAULT_FIVE_PASS_ENGINE,
         "auto_readme": DEFAULT_AUTO_README,
     }
 
@@ -1079,15 +1113,6 @@ def normalize_model_value(value: object) -> str | None:
 
 def default_model_choice() -> str | None:
     return normalize_model_value(os.getenv("OLLAMA_MODEL"))
-
-
-def configured_fallback_model_choice() -> str | None:
-    return normalize_model_value(_CONFIGURED_FALLBACK_MODEL)
-
-
-def set_configured_fallback_model(value: str | None) -> None:
-    global _CONFIGURED_FALLBACK_MODEL
-    _CONFIGURED_FALLBACK_MODEL = normalize_model_value(value)
 
 
 def normalize_bool_value(value: object, default: bool) -> bool:
@@ -1140,16 +1165,12 @@ def load_config_file(path: Path) -> dict[str, ConfigValue] | None:
 
     config = build_runtime_config()
 
-    config["model"] = normalize_model_value(data.get("model"))
-    config["fallback_model"] = normalize_model_value(data.get("fallback_model"))
+    config["main_model"] = normalize_model_value(data.get("main_model", data.get("model")))
+    config["review_model"] = normalize_model_value(data.get("review_model", data.get("fallback_model")))
     config["ollama_url"] = normalize_ollama_url_value(data.get("ollama_url"))
     config["plan_mode"] = normalize_bool_value(data.get("plan_mode"), DEFAULT_PLAN_MODE)
     config["dry_run"] = normalize_bool_value(data.get("dry_run"), DEFAULT_DRY_RUN)
     config["auto_commit"] = normalize_bool_value(data.get("auto_commit"), DEFAULT_AUTO_COMMIT)
-    config["five_pass_engine"] = normalize_bool_value(
-        data.get("five_pass_engine"),
-        DEFAULT_FIVE_PASS_ENGINE,
-    )
     config["auto_readme"] = normalize_bool_value(data.get("auto_readme"), DEFAULT_AUTO_README)
     return config
 
@@ -1175,16 +1196,12 @@ def load_config(root: Path) -> dict[str, ConfigValue]:
 
 def save_config(_root: Path, config: dict[str, ConfigValue]) -> None:
     payload = {
-        "model": normalize_model_value(config.get("model")),
-        "fallback_model": normalize_model_value(config.get("fallback_model")),
+        "main_model": normalize_model_value(config.get("main_model")),
+        "review_model": normalize_model_value(config.get("review_model")),
         "ollama_url": normalize_ollama_url_value(config.get("ollama_url")),
         "plan_mode": normalize_bool_value(config.get("plan_mode"), DEFAULT_PLAN_MODE),
         "dry_run": normalize_bool_value(config.get("dry_run"), DEFAULT_DRY_RUN),
         "auto_commit": normalize_bool_value(config.get("auto_commit"), DEFAULT_AUTO_COMMIT),
-        "five_pass_engine": normalize_bool_value(
-            config.get("five_pass_engine"),
-            DEFAULT_FIVE_PASS_ENGINE,
-        ),
         "auto_readme": normalize_bool_value(config.get("auto_readme"), DEFAULT_AUTO_README),
     }
     state_dir = ensure_user_state_dir()
@@ -1214,11 +1231,11 @@ def format_model_name(model: str | None) -> str:
     return "automatic"
 
 
-def format_fallback_model_name(model: str | None) -> str:
+def format_review_model_name(model: str | None) -> str:
     normalized = normalize_model_value(model)
     if normalized:
         return normalized
-    return "automatic (built-in fallback order)"
+    return "automatic (same as main model)"
 
 
 def default_ollama_url(raw: str | None = None) -> str:
@@ -1251,7 +1268,7 @@ def is_cloud_target(model: str | None, ollama_url: str | None) -> bool:
 def sync_session_usage_target(model: str | None, ollama_url: str | None) -> None:
     global _SESSION_USAGE
 
-    resolved = normalize_model_value(model) or default_model_choice() or configured_fallback_model_choice()
+    resolved = resolve_active_model(model, ollama_url)
     _SESSION_USAGE.last_resolved_model = resolved
     _SESSION_USAGE.last_target_was_cloud = is_cloud_target(resolved, ollama_url)
     if (
@@ -1265,21 +1282,12 @@ def sync_session_usage_target(model: str | None, ollama_url: str | None) -> None
 
 def pick_auto_model(models: list[str]) -> str | None:
     available = unique_preserve(models)
-    configured_fallback = configured_fallback_model_choice()
-
-    if configured_fallback:
-        if not available:
-            return configured_fallback
-        for model in available:
-            if model.lower() == configured_fallback.lower():
-                return model
-        return configured_fallback
 
     if not available:
         return None
 
     by_lower = {model.lower(): model for model in available}
-    for candidate in OLLAMA_FALLBACK_MODELS:
+    for candidate in OLLAMA_PREFERRED_MODELS:
         matched = by_lower.get(candidate.lower())
         if matched and not is_cloud_model(matched):
             return matched
@@ -1303,6 +1311,17 @@ def resolve_active_model(model: str | None, ollama_url: str | None = None) -> st
     return pick_auto_model(discover_ollama_models(ollama_url or default_ollama_url()))
 
 
+def resolve_review_model(
+    review_model: str | None,
+    main_model: str | None,
+    ollama_url: str | None = None,
+) -> str | None:
+    normalized = normalize_model_value(review_model)
+    if normalized:
+        return normalized
+    return resolve_active_model(main_model, ollama_url)
+
+
 def format_ollama_target(model: str | None, ollama_url: str | None = None) -> str:
     active_model = resolve_active_model(model, ollama_url)
     if active_model:
@@ -1310,19 +1329,32 @@ def format_ollama_target(model: str | None, ollama_url: str | None = None) -> st
     return "engine: ollama, model: not configured"
 
 
-def show_model_status(model: str | None, ollama_url: str | None = None) -> None:
-    explicit_model = normalize_model_value(model)
-    active_model = resolve_active_model(model, ollama_url)
+def show_model_status(
+    main_model: str | None,
+    review_model: str | None,
+    ollama_url: str | None = None,
+) -> None:
+    explicit_main_model = normalize_model_value(main_model)
+    resolved_main_model = resolve_active_model(main_model, ollama_url)
+    explicit_review_model = normalize_model_value(review_model)
+    resolved_review_model = resolve_review_model(review_model, main_model, ollama_url)
 
-    if explicit_model:
-        print(c(f"Model: {explicit_model}", GREEN))
-        return
+    if explicit_main_model:
+        print(c(f"Main model: {explicit_main_model}", GREEN))
+    elif resolved_main_model:
+        print(c(f"Main model: automatic ({resolved_main_model})", YELLOW))
+    else:
+        print(c("Main model: automatic (no Ollama model available)", RED))
 
-    if active_model:
-        print(c(f"Model: automatic ({active_model})", YELLOW))
-        return
-
-    print(c("Model: automatic (no Ollama model available)", RED))
+    if explicit_review_model:
+        print(c(f"Review model: {explicit_review_model}", GREEN))
+    elif resolved_review_model:
+        if resolved_review_model == resolved_main_model:
+            print(c("Review model: automatic (same as main model)", YELLOW))
+        else:
+            print(c(f"Review model: automatic ({resolved_review_model})", YELLOW))
+    else:
+        print(c("Review model: automatic (no Ollama model available)", RED))
 
 
 def usage_snapshot_from_response(data: object, active_model: str | None) -> UsageSnapshot | None:
@@ -1498,6 +1530,137 @@ def request_json(
         return None, raw_text or "Invalid JSON response"
 
 
+def parse_num_ctx_parameter(parameters: object) -> int | None:
+    if not isinstance(parameters, str):
+        return None
+
+    match = re.search(r"\bnum_ctx(?:\s+|=)(\d+)\b", parameters)
+    if not match:
+        return None
+
+    value = safe_int(match.group(1))
+    return value or None
+
+
+def extract_model_info_context_length(model_info: object) -> int | None:
+    if not isinstance(model_info, dict):
+        return None
+
+    candidates: list[int] = []
+    for raw_key, raw_value in model_info.items():
+        key = str(raw_key).lower()
+        if "context_length" not in key and "context_window" not in key:
+            continue
+
+        value = safe_int(raw_value)
+        if value > 0:
+            candidates.append(value)
+
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def discover_running_model_context_length(
+    model: str,
+    ollama_url: str | None = None,
+) -> int | None:
+    base_url = default_ollama_url(ollama_url)
+    data = fetch_json(build_ollama_api_url(base_url, "/ps"), headers=build_ollama_headers(base_url))
+    if not isinstance(data, dict):
+        return None
+
+    items = data.get("models")
+    if not isinstance(items, list):
+        return None
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        name = normalize_model_value(item.get("name"))
+        if not name or name.lower() != model.lower():
+            continue
+
+        context_length = safe_int(item.get("context_length"))
+        if context_length > 0:
+            return context_length
+
+    return None
+
+
+def fetch_model_details(model: str, ollama_url: str | None = None) -> dict[str, object] | None:
+    base_url = default_ollama_url(ollama_url)
+    data, error = request_json(
+        build_ollama_api_url(base_url, "/show"),
+        payload={"model": model},
+        headers=build_ollama_headers(base_url),
+        timeout=MODEL_DISCOVERY_TIMEOUT_SECONDS,
+    )
+    if error is not None or not isinstance(data, dict):
+        return None
+    return data
+
+
+def resolve_model_context_info(
+    model: str | None,
+    ollama_url: str | None = None,
+) -> ModelContextInfo:
+    active_model = resolve_active_model(model, ollama_url)
+    if not active_model:
+        prompt_budget = min(
+            MAX_PROMPT_CHARS,
+            int(DEFAULT_CONTEXT_WINDOW_TOKENS * APPROX_CHARS_PER_TOKEN * PROMPT_CONTEXT_USAGE_RATIO),
+        )
+        return ModelContextInfo(prompt_budget_chars=max(MIN_PROJECT_CONTEXT_CHARS, prompt_budget))
+
+    running_context = discover_running_model_context_length(active_model, ollama_url)
+    details = fetch_model_details(active_model, ollama_url) or {}
+    configured_num_ctx = parse_num_ctx_parameter(details.get("parameters"))
+    max_context = extract_model_info_context_length(details.get("model_info"))
+
+    source = "default"
+    context_window_tokens = running_context
+    if context_window_tokens:
+        source = "api-ps"
+    elif configured_num_ctx:
+        context_window_tokens = configured_num_ctx
+        source = "api-show-parameters"
+    else:
+        context_window_tokens = DEFAULT_CONTEXT_WINDOW_TOKENS
+        if max_context and max_context < context_window_tokens:
+            context_window_tokens = max_context
+            source = "api-show-model-info"
+
+    if max_context:
+        context_window_tokens = min(context_window_tokens, max_context)
+
+    prompt_budget_chars = int(context_window_tokens * APPROX_CHARS_PER_TOKEN * PROMPT_CONTEXT_USAGE_RATIO)
+    prompt_budget_chars = max(MIN_PROJECT_CONTEXT_CHARS, min(MAX_PROMPT_CHARS, prompt_budget_chars))
+
+    return ModelContextInfo(
+        model=active_model,
+        context_window_tokens=context_window_tokens,
+        max_context_tokens=max_context,
+        source=source,
+        prompt_budget_chars=prompt_budget_chars,
+    )
+
+
+def collect_context_for_prompt(
+    root: Path,
+    model: str | None,
+    ollama_url: str | None,
+    prompt_factory,
+) -> tuple[str, ProjectContextStats, ModelContextInfo]:
+    context_info = resolve_model_context_info(model, ollama_url)
+    empty_prompt = prompt_factory("")
+    available_for_project = context_info.prompt_budget_chars - len(empty_prompt)
+    project_budget = max(0, min(MAX_PROMPT_CHARS, available_for_project))
+    project_text, stats = collect_project_context(root, max_chars=project_budget)
+    return project_text, stats, context_info
+
+
 def discover_ollama_models(ollama_url: str | None = None) -> list[str]:
     url = default_ollama_url(ollama_url)
     data = fetch_json(build_ollama_api_url(url, "/tags"), headers=build_ollama_headers(url))
@@ -1555,7 +1718,7 @@ def discover_model_choices(
         discovered
         + ([env_model] if env_model else [])
         + ([current_model] if current_model else [])
-        + OLLAMA_FALLBACK_MODELS
+        + OLLAMA_PREFERRED_MODELS
     )
 
     return combined, note, True
@@ -1665,17 +1828,17 @@ def prompt_model_selection(
         print(c("Invalid model. Try again or press enter to cancel.", RED))
 
 
-def prompt_fallback_model_selection(
+def prompt_review_model_selection(
     ollama_url: str | None,
-    current_fallback_model: str | None,
+    current_review_model: str | None,
 ) -> tuple[bool, str | None]:
     return prompt_model_selection(
         ollama_url=ollama_url,
-        current_model=current_fallback_model,
-        title="Available fallback models:",
-        default_label=format_fallback_model_name(None),
+        current_model=current_review_model,
+        title="Available review models:",
+        default_label=format_review_model_name(None),
         default_tag="automatic",
-        prompt_label="fallback-model",
+        prompt_label="review-model",
         include_env_tag=False,
     )
 
@@ -1779,6 +1942,15 @@ def build_validation_feedback(
     if test_failures:
         parts.append("TEST ERRORS:\n" + "\n\n".join(test_failures))
     return "\n\n".join(parts).strip()
+
+
+def build_response_feedback(message: str) -> str:
+    return (
+        "RESULT: ERRORS\n\n"
+        "MODEL RESPONSE ERROR:\n"
+        f"{message.strip()}\n\n"
+        "Return only valid unified diff patches or NO_CHANGES."
+    ).strip()
 
 
 def build_code_prompt(
@@ -2140,7 +2312,7 @@ def call_ollama(
         print(c("Error while running Ollama.", RED), file=sys.stderr)
         print(
             c(
-                "No model configured or available. Use /model, /fallback-model, or set OLLAMA_MODEL.",
+                "No model configured or available. Use /mainmodel, /review-model, or set OLLAMA_MODEL.",
                 YELLOW,
             ),
             file=sys.stderr,
@@ -2730,7 +2902,8 @@ def build_generated_readme_instructions(
             "",
             "### Validation And Test Flow",
             "- Syntax checks run automatically based on file type.",
-            "- If checks fail, changes are rolled back and a corrective pass is executed.",
+            "- Validation, tests, and review ratification can trigger corrective passes on the current diff.",
+            "- Changes are rolled back only if the workflow cannot converge within the allowed attempts.",
         ]
     )
 
@@ -2847,6 +3020,7 @@ def apply_pass(
 
     if not response.strip():
         result.no_changes = True
+        result.retry_feedback = build_response_feedback("The previous response was empty.")
         return result
 
     if response.strip() == "NO_CHANGES":
@@ -2866,16 +3040,25 @@ def apply_pass(
         if rejected:
             print(c(f"\n❌ Patch rejected: invalid paths: {', '.join(rejected)}", RED))
             result.valid_response = False
+            result.retry_feedback = build_response_feedback(
+                f"Invalid patch paths were returned: {', '.join(rejected)}."
+            )
             return result
 
         if not rel_paths:
             result.valid_response = False
+            result.retry_feedback = build_response_feedback(
+                "The patch response did not include any valid project-relative file paths."
+            )
             return result
 
         patch_ok, patch_error = check_unified_patch(root, patch_text)
         if not patch_ok:
             print(c(f"\n❌ Patch check failed: {preview_text(patch_error, max_chars=300)}", RED))
             result.valid_response = False
+            result.retry_feedback = build_response_feedback(
+                f"Patch check failed: {preview_text(patch_error, max_chars=600)}"
+            )
             return result
 
         restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
@@ -2886,6 +3069,9 @@ def apply_pass(
         if not applied:
             print(c(f"\n❌ Patch apply failed: {preview_text(patch_error, max_chars=300)}", RED))
             result.valid_response = False
+            result.retry_feedback = build_response_feedback(
+                f"Patch apply failed: {preview_text(patch_error, max_chars=600)}"
+            )
             return result
 
         result.written = rel_paths
@@ -2896,6 +3082,9 @@ def apply_pass(
 
         if not files_map:
             result.valid_response = False
+            result.retry_feedback = build_response_feedback(
+                "The response did not contain valid patch blocks or file blocks."
+            )
             return result
 
         rel_paths = list(files_map.keys())
@@ -2935,117 +3124,15 @@ def apply_pass(
                 print(c(f"  - {preview_text(failure, max_chars=300)}", YELLOW))
             restore_files(root, restore_snapshot)
             result.changed_files = compute_changed_files(root, restore_snapshot)
+            result.retry_feedback = build_validation_feedback(
+                result.validation_ok,
+                result.validation_reports,
+                result.validation_failures,
+                test_reports=result.test_reports,
+                test_failures=result.test_failures,
+            )
 
     return result
-
-
-def run_five_pass_engine(
-    root: Path,
-    project_text: str,
-    request: str,
-    ollama_url: str,
-    model: str | None,
-    request_history: str = "",
-    backup: dict[str, str | None] | None = None,
-) -> tuple[bool, list[str]]:
-    print(c("\n🔄 Starting five-pass engine...", BOLD + CYAN))
-
-    backup_map = backup if backup is not None else {}
-    all_written: list[str] = []
-
-    plan_text = ""
-    plan_prompt = build_plan_prompt(project_text, request, request_history)
-    plan_text = call_ollama(plan_prompt, ollama_url, model, plan_mode=True)
-    plan_text = clean_plan_output(plan_text)
-    if plan_text:
-        print(c("\n📋 Plan generated.", GREEN))
-
-    draft_result = apply_pass(
-        root=root,
-        project_text=project_text,
-        request=request,
-        ollama_url=ollama_url,
-        model=model,
-        plan_text=plan_text,
-        request_history=request_history,
-        backup=backup_map,
-    )
-
-    all_written.extend(draft_result.changed_files)
-
-    if not draft_result.valid_response or draft_result.no_changes:
-        print(c("\n⚠️ Draft pass did not produce changes.", YELLOW))
-        return draft_result.validation_ok, unique_preserve(all_written)
-
-    review_project_text, _ = collect_project_context(root)
-
-    session_diff = build_session_diff(root, backup_map, draft_result.changed_files)
-
-    validation_text = ""
-    if (
-        draft_result.validation_reports
-        or draft_result.validation_failures
-        or draft_result.test_reports
-        or draft_result.test_failures
-    ):
-        validation_text = build_validation_feedback(
-            draft_result.validation_ok,
-            draft_result.validation_reports,
-            draft_result.validation_failures,
-            test_reports=draft_result.test_reports,
-            test_failures=draft_result.test_failures,
-        )
-
-    review_prompt = build_review_prompt(
-        project_text=review_project_text,
-        request=request,
-        plan_text=plan_text,
-        request_history=request_history,
-        validation_text=validation_text,
-        session_diff=session_diff,
-    )
-
-    review_text = call_ollama(review_prompt, ollama_url, model, plan_mode=False)
-    review_text = clean_plan_output(review_text)
-
-    print(c("\n🔍 Review completed.", GREEN))
-
-    fix_result = apply_pass(
-        root=root,
-        project_text=review_project_text,
-        request=request,
-        ollama_url=ollama_url,
-        model=model,
-        plan_text=plan_text,
-        request_history=request_history,
-        review_text=review_text,
-        validation_text=validation_text,
-        session_diff=session_diff,
-        backup=backup_map,
-    )
-
-    all_written.extend(fix_result.changed_files)
-
-    polish_project_text, _ = collect_project_context(root)
-    polish_session_diff = build_session_diff(root, backup_map, unique_preserve(all_written))
-
-    polish_result = apply_pass(
-        root=root,
-        project_text=polish_project_text,
-        request=request,
-        ollama_url=ollama_url,
-        model=model,
-        plan_text=plan_text,
-        request_history=request_history,
-        session_diff=polish_session_diff,
-        backup=backup_map,
-    )
-
-    all_written.extend(polish_result.changed_files)
-
-    print(c("\n✅ Five-pass engine completed.", GREEN))
-
-    return polish_result.validation_ok, unique_preserve(all_written)
 
 
 def review_verdict_ok(review_text: str) -> bool:
@@ -3059,71 +3146,216 @@ def review_verdict_ok(review_text: str) -> bool:
     return False
 
 
-def enforce_functional_guardrail(
+def normalize_review_feedback(review_text: str) -> str:
+    cleaned = clean_plan_output(review_text).strip()
+    if cleaned:
+        return cleaned
+    return (
+        "VERDICT: FIX\n"
+        "ISSUES:\n"
+        "- review model returned an empty verdict\n"
+        "FIXES:\n"
+        "- inspect the latest diff and complete the missing work\n"
+        "FILES:\n"
+        "- none"
+    )
+
+
+def maybe_show_context_summary(
+    shown: bool,
+    stats: ProjectContextStats,
+    context_info: ModelContextInfo,
+) -> bool:
+    if shown:
+        return True
+    show_context_summary(stats, context_info)
+    return True
+
+
+def run_review_workflow(
     root: Path,
     request: str,
     ollama_url: str,
-    model: str | None,
+    main_model: str | None,
+    review_model: str | None,
     request_history: str,
-    backup: dict[str, str | None],
-    written: list[str],
-    plan_text: str = "",
-) -> tuple[bool, list[str]]:
-    changed = unique_preserve(written)
-    if not changed:
-        return True, changed
+    plan_mode: bool,
+    backup: dict[str, str | None] | None = None,
+) -> tuple[bool, list[str], str]:
+    backup_map = backup if backup is not None else {}
+    plan_text = ""
+    review_feedback = ""
+    validation_feedback = ""
+    main_context_shown = False
+    review_context_shown = False
 
-    for attempt in range(FUNCTIONAL_GUARDRAIL_MAX_FIXES + 1):
-        review_project_text, _ = collect_project_context(root)
-        session_diff = build_session_diff(root, backup, changed)
+    if plan_mode:
+        plan_factory = lambda project_text: build_plan_prompt(project_text, request, request_history)
+        plan_project_text, plan_stats, plan_context_info = collect_context_for_prompt(
+            root=root,
+            model=main_model,
+            ollama_url=ollama_url,
+            prompt_factory=plan_factory,
+        )
+        main_context_shown = maybe_show_context_summary(main_context_shown, plan_stats, plan_context_info)
+        plan_prompt = build_plan_prompt(plan_project_text, request, request_history)
+        plan_text = clean_plan_output(call_ollama(plan_prompt, ollama_url, main_model, plan_mode=True))
+        if plan_text:
+            print(c("\n📋 Plan generated.", GREEN))
+
+    print(c("\n🔄 Starting main/review workflow...", BOLD + CYAN))
+
+    for attempt in range(1, WORKFLOW_MAX_ATTEMPTS + 1):
+        print(c(f"\n🛠️ Main pass {attempt}/{WORKFLOW_MAX_ATTEMPTS}", CYAN))
+        current_changed = compute_changed_files(root, backup_map)
+        session_diff = build_session_diff(root, backup_map, current_changed)
+        code_factory = lambda project_text: build_code_prompt(
+            project_text=project_text,
+            request=request,
+            objective=(
+                "fix the issues identified in the review"
+                if review_feedback.strip()
+                else (
+                    "fix the syntax errors and validation failures"
+                    if validation_feedback.strip() and "ERRORS" in validation_feedback
+                    else "deliver a complete first implementation that matches the request"
+                )
+            ),
+            plan_text=plan_text,
+            request_history=request_history,
+            review_text=review_feedback,
+            validation_text=validation_feedback,
+            session_diff=session_diff,
+        )
+        project_text, stats, main_context_info = collect_context_for_prompt(
+            root=root,
+            model=main_model,
+            ollama_url=ollama_url,
+            prompt_factory=code_factory,
+        )
+        main_context_shown = maybe_show_context_summary(main_context_shown, stats, main_context_info)
+
+        result = apply_pass(
+            root=root,
+            project_text=project_text,
+            request=request,
+            ollama_url=ollama_url,
+            model=main_model,
+            plan_text=plan_text,
+            request_history=request_history,
+            review_text=review_feedback,
+            validation_text=validation_feedback,
+            session_diff=session_diff,
+            backup=backup_map,
+        )
+        changed = compute_changed_files(root, backup_map)
+
+        if not result.valid_response:
+            validation_feedback = result.retry_feedback or build_response_feedback(
+                "The previous response was not usable."
+            )
+            review_feedback = ""
+            if attempt < WORKFLOW_MAX_ATTEMPTS:
+                print(c("\n⚠️ Main model returned an unusable response. Retrying with explicit feedback.", YELLOW))
+                continue
+            break
+
+        if result.no_changes and not changed:
+            if attempt == 1:
+                print(c("\nℹ️ No changes requested by the model.", MUTED))
+                return True, [], plan_text
+            validation_feedback = build_response_feedback(
+                "The previous pass did not produce effective file changes."
+            )
+            review_feedback = ""
+            if attempt < WORKFLOW_MAX_ATTEMPTS:
+                print(c("\n⚠️ No effective changes produced. Retrying with explicit feedback.", YELLOW))
+                continue
+            break
+
+        if not result.validation_ok:
+            validation_feedback = result.retry_feedback or build_validation_feedback(
+                result.validation_ok,
+                result.validation_reports,
+                result.validation_failures,
+                test_reports=result.test_reports,
+                test_failures=result.test_failures,
+            )
+            review_feedback = ""
+            if attempt < WORKFLOW_MAX_ATTEMPTS:
+                print(c("\n⚠️ Validation or tests failed. Reworking from feedback...", YELLOW))
+                continue
+            break
+
+        changed = compute_changed_files(root, backup_map)
+        if not changed:
+            print(c("\nℹ️ No net file changes after validation.", MUTED))
+            return True, [], plan_text
+
+        print(c(f"\n🔍 Review pass {attempt}/{WORKFLOW_MAX_ATTEMPTS}", CYAN))
+        review_factory = lambda project_text: build_review_prompt(
+            project_text=project_text,
+            request=request,
+            plan_text=plan_text,
+            request_history=request_history,
+            validation_text=build_validation_feedback(
+                result.validation_ok,
+                result.validation_reports,
+                result.validation_failures,
+                test_reports=result.test_reports,
+                test_failures=result.test_failures,
+            ),
+            session_diff=build_session_diff(root, backup_map, changed),
+        )
+        review_project_text, review_stats, review_context_info = collect_context_for_prompt(
+            root=root,
+            model=resolve_review_model(review_model, main_model, ollama_url),
+            ollama_url=ollama_url,
+            prompt_factory=review_factory,
+        )
+        review_context_shown = maybe_show_context_summary(review_context_shown, review_stats, review_context_info)
+
         review_prompt = build_review_prompt(
             project_text=review_project_text,
             request=request,
             plan_text=plan_text,
             request_history=request_history,
-            session_diff=session_diff,
+            validation_text=build_validation_feedback(
+                result.validation_ok,
+                result.validation_reports,
+                result.validation_failures,
+                test_reports=result.test_reports,
+                test_failures=result.test_failures,
+            ),
+            session_diff=build_session_diff(root, backup_map, changed),
         )
-        review_text = clean_plan_output(call_ollama(review_prompt, ollama_url, model, plan_mode=False))
+        review_text = normalize_review_feedback(
+            call_ollama(review_prompt, ollama_url, resolve_review_model(review_model, main_model, ollama_url), plan_mode=False)
+        )
 
         if review_verdict_ok(review_text):
-            print(c("\n✅ Functional guardrail: request verified.", GREEN))
-            return True, changed
+            print(c("\n✅ Review model ratified the changes.", GREEN))
+            return True, changed, plan_text
 
-        if attempt >= FUNCTIONAL_GUARDRAIL_MAX_FIXES:
-            break
-
-        print(c(
-            (
-                f"\n⚠️ Functional guardrail found gaps (fix pass {attempt + 1}/"
-                f"{FUNCTIONAL_GUARDRAIL_MAX_FIXES}). Reworking..."
-            ),
-            YELLOW,
-        ))
-
-        fix_result = apply_pass(
-            root=root,
-            project_text=review_project_text,
-            request=request,
-            ollama_url=ollama_url,
-            model=model,
-            plan_text=plan_text,
-            request_history=request_history,
-            review_text=review_text,
-            session_diff=session_diff,
-            backup=backup,
+        review_feedback = review_text
+        validation_feedback = build_validation_feedback(
+            result.validation_ok,
+            result.validation_reports,
+            result.validation_failures,
+            test_reports=result.test_reports,
+            test_failures=result.test_failures,
         )
-
-        changed = unique_preserve(compute_changed_files(root, backup))
-
-        if not fix_result.validation_ok:
-            return False, changed
+        if attempt < WORKFLOW_MAX_ATTEMPTS:
+            print(c("\n⚠️ Review model requested corrections. Reworking...", YELLOW))
+            continue
+        break
 
     print(c(
-        "\n❌ Functional guardrail could not verify the request after multiple fix passes. Rolling back.",
+        "\n❌ Workflow could not converge after multiple passes. Rolling back.",
         RED,
     ))
-    restore_files(root, backup)
-    return False, compute_changed_files(root, backup)
+    restore_files(root, backup_map)
+    return False, compute_changed_files(root, backup_map), plan_text
 
 
 def make_commit_message(
@@ -3206,95 +3438,31 @@ def process_request(
     root: Path,
     request: str,
     ollama_url: str,
-    model: str | None,
+    main_model: str | None,
+    review_model: str | None,
     plan_mode: bool,
     dry_run: bool,
     auto_commit: bool,
-    five_pass_engine: bool,
     auto_readme: bool,
 ) -> bool:
     save_last_request(root, request)
 
     request_history = build_request_history_context(root)
-    request_summary = summarize_request_for_history(request, ollama_url, model)
+    request_summary = summarize_request_for_history(request, ollama_url, main_model)
     print(c(f"Request summary: {request_summary}", CYAN))
     append_request_history(root, request_summary)
 
-    project_text, stats = collect_project_context(root)
-    show_context_summary(stats)
-
     backup: dict[str, str | None] = {}
-    written: list[str] = []
-    validation_ok = True
-
-    if five_pass_engine:
-        validation_ok, written = run_five_pass_engine(
-            root=root,
-            project_text=project_text,
-            request=request,
-            ollama_url=ollama_url,
-            model=model,
-            request_history=request_history,
-            backup=backup,
-        )
-    else:
-        result = apply_pass(
-            root=root,
-            project_text=project_text,
-            request=request,
-            ollama_url=ollama_url,
-            model=model,
-            plan_text="" if not plan_mode else call_ollama(
-                build_plan_prompt(project_text, request, request_history),
-                ollama_url,
-                model,
-                plan_mode=True,
-            ),
-            request_history=request_history,
-            backup=backup,
-        )
-        written = result.changed_files
-        validation_ok = result.validation_ok
-
-        if (
-            not result.validation_ok
-            and result.valid_response
-            and not result.no_changes
-        ):
-            print(c("\n🔁 Running corrective pass from validation/test feedback...", YELLOW))
-            validation_text = build_validation_feedback(
-                result.validation_ok,
-                result.validation_reports,
-                result.validation_failures,
-                test_reports=result.test_reports,
-                test_failures=result.test_failures,
-            )
-            refreshed_project_text, _ = collect_project_context(root)
-            correction_result = apply_pass(
-                root=root,
-                project_text=refreshed_project_text,
-                request=request,
-                ollama_url=ollama_url,
-                model=model,
-                plan_text="",
-                request_history=request_history,
-                validation_text=validation_text,
-                backup=backup,
-            )
-            validation_ok = correction_result.validation_ok
-            written = compute_changed_files(root, backup)
-
-    if validation_ok and written:
-        validation_ok, written = enforce_functional_guardrail(
-            root=root,
-            request=request,
-            ollama_url=ollama_url,
-            model=model,
-            request_history=request_history,
-            backup=backup,
-            written=written,
-            plan_text="",
-        )
+    validation_ok, written, _ = run_review_workflow(
+        root=root,
+        request=request,
+        ollama_url=ollama_url,
+        main_model=main_model,
+        review_model=review_model,
+        request_history=request_history,
+        plan_mode=plan_mode,
+        backup=backup,
+    )
 
     if validation_ok and written and auto_readme:
         readme_changed, readme_rel = generate_readme_instructions_for_changes(
@@ -3327,7 +3495,7 @@ def process_request(
                     request,
                     written,
                     ollama_url=ollama_url,
-                    model=model,
+                    model=main_model,
                 )
 
     if DEFAULT_SHOW_DIFF and not dry_run and written:
@@ -3371,13 +3539,6 @@ def main() -> None:
         help="Disable automatic Git commits",
     )
     parser.add_argument(
-        "--no-engine",
-        dest="five_pass_engine",
-        action="store_false",
-        default=None,
-        help="Disable the five-pass engine",
-    )
-    parser.add_argument(
         "--no-readme",
         dest="auto_readme",
         action="store_false",
@@ -3389,9 +3550,8 @@ def main() -> None:
     root = ensure_git_repo()
 
     config = load_config(root)
-    model = normalize_model_value(config.get("model"))
-    fallback_model = normalize_model_value(config.get("fallback_model"))
-    set_configured_fallback_model(fallback_model)
+    main_model = normalize_model_value(config.get("main_model"))
+    review_model = normalize_model_value(config.get("review_model"))
 
     configured_ollama_url = normalize_ollama_url_value(config.get("ollama_url"))
     if args.ollama_url:
@@ -3404,11 +3564,6 @@ def main() -> None:
     plan_mode = resolve_runtime_bool_setting(args.plan_mode, config.get("plan_mode"), DEFAULT_PLAN_MODE)
     dry_run = resolve_runtime_bool_setting(args.dry_run, config.get("dry_run"), DEFAULT_DRY_RUN)
     auto_commit = resolve_runtime_bool_setting(args.auto_commit, config.get("auto_commit"), DEFAULT_AUTO_COMMIT)
-    five_pass_engine = resolve_runtime_bool_setting(
-        args.five_pass_engine,
-        config.get("five_pass_engine"),
-        DEFAULT_FIVE_PASS_ENGINE,
-    )
     auto_readme = resolve_runtime_bool_setting(args.auto_readme, config.get("auto_readme"), DEFAULT_AUTO_README)
 
     setup_readline()
@@ -3416,7 +3571,7 @@ def main() -> None:
     print(c("Welcome to ollama-code!", BOLD + GREEN))
     print(c(f"Working directory: {root}", MUTED))
     print(c(f"Ollama endpoint: {ollama_url}", MUTED))
-    show_model_status(model, ollama_url)
+    show_model_status(main_model, review_model, ollama_url)
     print()
 
     completer = SlashCommandCompleter(config, ollama_url)
@@ -3458,17 +3613,16 @@ def main() -> None:
                     continue
 
                 ollama_url = new_ollama_url
-                model = None
-                fallback_model = None
-                set_configured_fallback_model(None)
+                main_model = None
+                review_model = None
                 config["ollama_url"] = ollama_url
-                config["model"] = None
-                config["fallback_model"] = None
+                config["main_model"] = None
+                config["review_model"] = None
                 save_config(root, config)
                 completer.ollama_url = ollama_url
 
                 print(c(f"Ollama endpoint set to: {ollama_url}", GREEN))
-                print(c("Model and fallback model reset to automatic.", MUTED))
+                print(c("Main model and review model reset to automatic.", MUTED))
 
                 discovered_models = discover_ollama_models(ollama_url)
                 if discovered_models:
@@ -3489,10 +3643,10 @@ def main() -> None:
                             YELLOW,
                         )
                     )
-                show_model_status(model, ollama_url)
+                show_model_status(main_model, review_model, ollama_url)
             elif command == "/diff":
                 show_git_diff()
-            elif command == "/model":
+            elif command in {"/mainmodel", "/model"}:
                 if arg:
                     ok, selected = resolve_model_choice(
                         arg,
@@ -3500,23 +3654,29 @@ def main() -> None:
                         allow_custom=True,
                     )
                     if ok:
-                        model = selected
-                        config["model"] = model
+                        main_model = selected
+                        config["main_model"] = main_model
                         save_config(root, config)
-                        print(c(f"Model set to: {format_model_name(model)}", GREEN))
+                        print(c(f"Main model set to: {format_model_name(main_model)}", GREEN))
                     else:
                         print(c("Invalid model.", RED))
                 else:
-                    ok, selected = prompt_model_selection(ollama_url, model)
+                    ok, selected = prompt_model_selection(
+                        ollama_url,
+                        main_model,
+                        title="Available main models:",
+                        default_label=format_model_name(None),
+                        prompt_label="mainmodel",
+                    )
                     if ok:
-                        model = selected
-                        config["model"] = model
+                        main_model = selected
+                        config["main_model"] = main_model
                         save_config(root, config)
-                        if model:
-                            print(c(f"Model set to: {model}", GREEN))
+                        if main_model:
+                            print(c(f"Main model set to: {main_model}", GREEN))
                         else:
-                            print(c("Model reset to automatic.", GREEN))
-            elif command in {"/fallback-model", "/model-fallback"}:
+                            print(c("Main model reset to automatic.", GREEN))
+            elif command == "/review-model":
                 if arg:
                     ok, selected = resolve_model_choice(
                         arg,
@@ -3524,24 +3684,22 @@ def main() -> None:
                         allow_custom=True,
                     )
                     if ok:
-                        fallback_model = selected
-                        config["fallback_model"] = fallback_model
-                        set_configured_fallback_model(fallback_model)
+                        review_model = selected
+                        config["review_model"] = review_model
                         save_config(root, config)
-                        print(c(f"Fallback model set to: {format_fallback_model_name(fallback_model)}", GREEN))
+                        print(c(f"Review model set to: {format_review_model_name(review_model)}", GREEN))
                     else:
-                        print(c("Invalid fallback model.", RED))
+                        print(c("Invalid review model.", RED))
                 else:
-                    ok, selected = prompt_fallback_model_selection(ollama_url, fallback_model)
+                    ok, selected = prompt_review_model_selection(ollama_url, review_model)
                     if ok:
-                        fallback_model = selected
-                        config["fallback_model"] = fallback_model
-                        set_configured_fallback_model(fallback_model)
+                        review_model = selected
+                        config["review_model"] = review_model
                         save_config(root, config)
-                        if fallback_model:
-                            print(c(f"Fallback model set to: {fallback_model}", GREEN))
+                        if review_model:
+                            print(c(f"Review model set to: {review_model}", GREEN))
                         else:
-                            print(c("Fallback model reset to automatic.", GREEN))
+                            print(c("Review model reset to automatic.", GREEN))
             elif command == "/plan":
                 selected = resolve_toggle_choice(arg) if arg else None
                 if arg and selected is None:
@@ -3584,20 +3742,6 @@ def main() -> None:
                 if (arg and selected is not None) or (not arg and ok):
                     config["auto_commit"] = auto_commit
                     save_config(root, config)
-            elif command == "/engine":
-                selected = resolve_toggle_choice(arg) if arg else None
-                if arg and selected is None:
-                    print(c("Invalid value. Use on/off.", RED))
-                elif arg:
-                    five_pass_engine = bool(selected)
-                    print(c(f"Five-pass engine: {'ON' if five_pass_engine else 'OFF'}", GREEN))
-                else:
-                    ok, selected_value = prompt_toggle_selection("/engine", five_pass_engine)
-                    if ok:
-                        five_pass_engine = selected_value
-                if (arg and selected is not None) or (not arg and ok):
-                    config["five_pass_engine"] = five_pass_engine
-                    save_config(root, config)
             elif command == "/readme":
                 selected = resolve_toggle_choice(arg) if arg else None
                 if arg and selected is None:
@@ -3625,11 +3769,11 @@ def main() -> None:
                         root=root,
                         request=last_request,
                         ollama_url=ollama_url,
-                        model=model,
+                        main_model=main_model,
+                        review_model=review_model,
                         plan_mode=plan_mode,
                         dry_run=dry_run,
                         auto_commit=auto_commit,
-                        five_pass_engine=five_pass_engine,
                         auto_readme=auto_readme,
                     )
                 else:
@@ -3655,11 +3799,11 @@ def main() -> None:
             root=root,
             request=request,
             ollama_url=ollama_url,
-            model=model,
+            main_model=main_model,
+            review_model=review_model,
             plan_mode=plan_mode,
             dry_run=dry_run,
             auto_commit=auto_commit,
-            five_pass_engine=five_pass_engine,
             auto_readme=auto_readme,
         )
 
