@@ -157,11 +157,13 @@ class OllamaCodeTests(unittest.TestCase):
                 "http://127.0.0.1:11434",
                 "test-model",
                 context_info=context_info,
+                response_format=self.module.CODE_RESPONSE_SCHEMA,
             )
 
         self.assertEqual(response.strip(), "ok")
         self.assertIn("options", captured["payload"])
         self.assertGreater(captured["payload"]["options"]["num_ctx"], 4096)
+        self.assertEqual(captured["payload"]["format"], self.module.CODE_RESPONSE_SCHEMA)
 
     def test_run_review_workflow_retries_until_review_ok(self):
         apply_calls = []
@@ -223,8 +225,18 @@ class OllamaCodeTests(unittest.TestCase):
             target = root / "demo.py"
             target.write_text("print('old')\n", encoding="utf-8")
 
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
-                return "===FILE: demo.py===\nprint('new')\n===END===\n"
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None, response_format=None):
+                return json.dumps(
+                    {
+                        "operations": [
+                            {
+                                "action": "write",
+                                "path": "demo.py",
+                                "content": "print('new')\n",
+                            }
+                        ]
+                    }
+                )
 
             with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
                 self.module,
@@ -290,15 +302,12 @@ class OllamaCodeTests(unittest.TestCase):
             self.assertTrue(ok, error)
             self.assertEqual(target.read_text(encoding="utf-8"), "print('new')\n")
 
-    def test_apply_pass_applies_patch_blocks(self):
+    def test_apply_pass_rejects_patch_response_when_json_is_required(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
 
-            target = root / "demo.py"
-            target.write_text("print('old')\n", encoding="utf-8")
-
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None, response_format=None):
                 return (
                     "===PATCH===\n"
                     "--- a/demo.py\n"
@@ -311,13 +320,11 @@ class OllamaCodeTests(unittest.TestCase):
 
             with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
                 self.module,
-                "validate_written_files",
-                return_value=(True, ["demo.py (python): ok"], []),
-            ), mock.patch.object(
+                "check_unified_patch",
+            ) as check_mock, mock.patch.object(
                 self.module,
-                "run_project_tests",
-                return_value=(True, [], []),
-            ):
+                "apply_unified_patch",
+            ) as apply_mock:
                 result = self.module.apply_pass(
                     root=root,
                     project_text="",
@@ -327,11 +334,12 @@ class OllamaCodeTests(unittest.TestCase):
                     backup={},
                 )
 
-            self.assertTrue(result.validation_ok)
-            self.assertEqual(result.changed_files, ["demo.py"])
-            self.assertEqual(target.read_text(encoding="utf-8"), "print('new')\n")
+            self.assertFalse(result.valid_response)
+            self.assertIn("structured JSON object", result.retry_feedback)
+            check_mock.assert_not_called()
+            apply_mock.assert_not_called()
 
-    def test_apply_pass_applies_file_and_delete_blocks(self):
+    def test_apply_pass_applies_json_write_and_delete_operations(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             keep = root / "keep.py"
@@ -339,13 +347,21 @@ class OllamaCodeTests(unittest.TestCase):
             old = root / "old.txt"
             old.write_text("obsolete\n", encoding="utf-8")
 
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
-                return (
-                    "===FILE: keep.py===\n"
-                    "print('new')\n"
-                    "===END===\n"
-                    "===DELETE: old.txt===\n"
-                    "===END===\n"
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None, response_format=None):
+                return json.dumps(
+                    {
+                        "operations": [
+                            {
+                                "action": "write",
+                                "path": "keep.py",
+                                "content": "print('new')\n",
+                            },
+                            {
+                                "action": "delete",
+                                "path": "old.txt",
+                            },
+                        ]
+                    }
                 )
 
             with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
@@ -371,28 +387,67 @@ class OllamaCodeTests(unittest.TestCase):
             self.assertEqual(keep.read_text(encoding="utf-8"), "print('new')\n")
             self.assertFalse(old.exists())
 
-    def test_apply_pass_rejects_invalid_patch_paths_before_apply(self):
+    def test_apply_pass_applies_json_operations(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+            target = root / "demo.py"
+            target.write_text("print('old')\n", encoding="utf-8")
 
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
-                return (
-                    "===PATCH===\n"
-                    "--- /dev/null\n"
-                    "+++ b/../evil.py\n"
-                    "@@ -0,0 +1 @@\n"
-                    "+print('x')\n"
-                    "===END===\n"
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None, response_format=None):
+                return json.dumps(
+                    {
+                        "operations": [
+                            {
+                                "action": "write",
+                                "path": "demo.py",
+                                "content": "print('new')\n",
+                            }
+                        ]
+                    }
                 )
 
             with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
                 self.module,
-                "check_unified_patch",
-            ) as check_mock, mock.patch.object(
+                "validate_written_files",
+                return_value=(True, ["demo.py (python): ok"], []),
+            ), mock.patch.object(
                 self.module,
-                "apply_unified_patch",
-            ) as apply_mock:
+                "run_project_tests",
+                return_value=(True, [], []),
+            ):
+                result = self.module.apply_pass(
+                    root=root,
+                    project_text="",
+                    request="change demo.py",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    backup={},
+                )
+
+            self.assertTrue(result.validation_ok)
+            self.assertEqual(result.changed_files, ["demo.py"])
+            self.assertEqual(target.read_text(encoding="utf-8"), "print('new')\n")
+
+    def test_apply_pass_rejects_invalid_json_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None, response_format=None):
+                return json.dumps(
+                    {
+                        "operations": [
+                            {
+                                "action": "write",
+                                "path": "../evil.py",
+                                "content": "print('x')\n",
+                            }
+                        ]
+                    }
+                )
+
+            result = None
+            with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama):
                 result = self.module.apply_pass(
                     root=root,
                     project_text="",
@@ -404,36 +459,25 @@ class OllamaCodeTests(unittest.TestCase):
 
         self.assertFalse(result.valid_response)
         self.assertIn("../evil.py", result.rejected)
-        check_mock.assert_not_called()
-        apply_mock.assert_not_called()
+        self.assertIn("Invalid file paths", result.retry_feedback)
 
-    def test_apply_pass_stops_when_patch_check_fails(self):
+    def test_apply_pass_rejects_invalid_json_schema(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
 
-            target = root / "demo.py"
-            target.write_text("print('old')\n", encoding="utf-8")
-
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
-                return (
-                    "===PATCH===\n"
-                    "--- a/demo.py\n"
-                    "+++ b/demo.py\n"
-                    "@@ -1 +1 @@\n"
-                    "-print('old')\n"
-                    "+print('new')\n"
-                    "===END===\n"
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None, response_format=None):
+                return json.dumps(
+                    {
+                        "operations": [
+                            {
+                                "action": "write",
+                                "path": "demo.py",
+                            }
+                        ]
+                    }
                 )
 
-            with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
-                self.module,
-                "check_unified_patch",
-                return_value=(False, "hunk failed"),
-            ), mock.patch.object(
-                self.module,
-                "apply_unified_patch",
-            ) as apply_mock:
+            with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama):
                 result = self.module.apply_pass(
                     root=root,
                     project_text="",
@@ -443,9 +487,8 @@ class OllamaCodeTests(unittest.TestCase):
                     backup={},
                 )
 
-            self.assertFalse(result.valid_response)
-            self.assertEqual(target.read_text(encoding="utf-8"), "print('old')\n")
-            apply_mock.assert_not_called()
+        self.assertFalse(result.valid_response)
+        self.assertIn("missing content", result.retry_feedback.lower())
 
     def test_apply_pass_saves_last_response_for_last_command(self):
         with tempfile.TemporaryDirectory() as tmp:

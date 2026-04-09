@@ -217,6 +217,30 @@ PATCH_BLOCK_RE = re.compile(
 PATCH_HEADER_RE = re.compile(r"^(---|\+\+\+)\s+([^\n]+)$", re.MULTILINE)
 PATCH_DIFF_GIT_RE = re.compile(r"^diff --git a/(.+?) b/(.+)$", re.MULTILINE)
 
+CODE_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "operations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["write", "delete"],
+                    },
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["action", "path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["operations"],
+    "additionalProperties": False,
+}
+
 
 @dataclass
 class ProjectContextStats:
@@ -2036,13 +2060,14 @@ def build_code_prompt(
     return (
         "Role: terminal coding agent.\n"
         f"Pass objective: {objective}\n"
-        "Reply only with full file blocks for modified/new files and delete blocks for removals.\n\n"
+        "Reply only with a JSON object that matches the required schema.\n\n"
         "MANDATORY FORMAT:\n"
-        "===FILE: relative/path===\n"
-        "full file content\n"
-        "===END===\n\n"
-        "===DELETE: relative/path===\n"
-        "===END===\n\n"
+        "{\n"
+        '  "operations": [\n'
+        '    {"action": "write", "path": "relative/path", "content": "full file content"},\n'
+        '    {"action": "delete", "path": "relative/path"}\n'
+        "  ]\n"
+        "}\n\n"
         "RULES:\n"
         "- keep responses coherent and deterministic\n"
         "- preserve existing behavior unless the request requires changes\n"
@@ -2050,13 +2075,12 @@ def build_code_prompt(
         "- no explanation text\n"
         "- no markdown\n"
         "- no ``` blocks\n"
-        "- return only file blocks and delete blocks\n"
+        "- return only the JSON object\n"
         "- use only project-relative paths\n"
         "- do not touch ollama-code internal files\n"
         "- do not return unchanged files\n"
         "- every changed file must include the complete final file content\n"
-        "- every delete block must remove exactly one existing project file\n"
-        "- always close each block with a separate line containing exactly ===END===\n"
+        "- every delete operation must remove exactly one existing project file\n"
         "- if nothing needs to change, return exactly: NO_CHANGES\n\n"
         f"{history_section}"
         f"{plan_section}"
@@ -2347,6 +2371,7 @@ def call_ollama(
     model: str | None,
     plan_mode: bool = False,
     context_info: ModelContextInfo | None = None,
+    response_format: object | None = None,
 ) -> str:
     active_model = resolve_active_model(model, ollama_url)
     last_error = ""
@@ -2398,6 +2423,9 @@ def call_ollama(
             "num_ctx": desired_num_ctx_for_prompt(prompt, resolved_context_info),
         },
     }
+    if response_format is not None:
+        payload["format"] = response_format
+        payload["options"]["temperature"] = 0
 
     for attempt in range(1, OLLAMA_MAX_ATTEMPTS + 1):
         start = time.time()
@@ -2484,6 +2512,72 @@ def parse_delete_blocks(text: str) -> list[str]:
         if rel:
             deleted.append(rel)
     return unique_preserve(deleted)
+
+
+def parse_json_payload(text: str) -> object | None:
+    stripped = text.strip()
+    if not stripped or stripped == "NO_CHANGES":
+        return None
+
+    try:
+        return json.loads(stripped)
+    except Exception:
+        pass
+
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text):
+        if ch not in "[{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(text[idx:])
+            return data
+        except Exception:
+            continue
+
+    return None
+
+
+def parse_code_operations_response(
+    text: str,
+) -> tuple[bool, Dict[str, str], list[str], list[str], str | None]:
+    data = parse_json_payload(text)
+    if data is None:
+        return False, {}, [], [], None
+
+    if not isinstance(data, dict):
+        return True, {}, [], [], "The JSON response must be an object."
+
+    operations = data.get("operations")
+    if not isinstance(operations, list):
+        return True, {}, [], [], "The JSON response must contain an 'operations' array."
+
+    files_map: Dict[str, str] = {}
+    delete_paths: list[str] = []
+    rejected: list[str] = []
+
+    for item in operations:
+        if not isinstance(item, dict):
+            return True, {}, [], [], "Every operation must be a JSON object."
+
+        action = str(item.get("action", "")).strip().lower()
+        path = str(item.get("path", "")).strip()
+        if not path:
+            return True, {}, [], [], "Every operation must include a non-empty path."
+
+        if not is_valid_relpath(path):
+            rejected.append(path)
+            continue
+
+        if action == "write":
+            if "content" not in item:
+                return True, {}, [], [], f"Write operation for {path} is missing content."
+            files_map[path] = str(item.get("content", "")).rstrip("\n") + "\n"
+        elif action == "delete":
+            delete_paths.append(path)
+        else:
+            return True, {}, [], [], f"Unsupported action '{action}' for {path}."
+
+    return True, files_map, unique_preserve(delete_paths), unique_preserve(rejected), None
 
 
 def parse_patch_blocks(text: str) -> list[str]:
@@ -3092,7 +3186,14 @@ def apply_pass(
         session_diff=session_diff,
     )
 
-    response = call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=context_info)
+    response = call_ollama(
+        prompt,
+        ollama_url,
+        model,
+        plan_mode=False,
+        context_info=context_info,
+        response_format=CODE_RESPONSE_SCHEMA,
+    )
     save_last_response(root, response)
 
     result = AppliedPassResult(
@@ -3109,125 +3210,82 @@ def apply_pass(
         result.no_changes = True
         return result
 
-    files_map = parse_file_blocks(response)
-    delete_paths = parse_delete_blocks(response)
-    wrote_from_patch = False
+    json_found, files_map, delete_paths, json_rejected, json_error = parse_code_operations_response(response)
+    if not json_found:
+        result.valid_response = False
+        result.retry_feedback = build_response_feedback(
+            "The response did not contain a valid structured JSON object."
+        )
+        return result
+    if json_found and json_error:
+        result.valid_response = False
+        result.retry_feedback = build_response_feedback(json_error)
+        return result
+    if json_rejected:
+        result.rejected = json_rejected
+        result.valid_response = False
+        result.retry_feedback = build_response_feedback(
+            f"Invalid file paths were returned: {', '.join(json_rejected)}."
+        )
+        return result
+    if json_found and not files_map and not delete_paths:
+        result.no_changes = True
+        return result
+
     restore_snapshot: dict[str, str | None] | None = None
-    wrote_from_blocks = False
+    result.files_map = files_map
+    rel_paths = unique_preserve(list(files_map.keys()) + delete_paths)
+    restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
+    if backup is not None:
+        extend_backup(root, backup, rel_paths)
 
-    if files_map or delete_paths:
-        result.files_map = files_map
-        rel_paths = unique_preserve(list(files_map.keys()) + delete_paths)
-        restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
-        if backup is not None:
-            extend_backup(root, backup, rel_paths)
+    written, rejected = write_files(root, files_map)
+    deleted, delete_rejected = delete_files(root, delete_paths)
+    result.written = unique_preserve(written + deleted)
+    result.rejected = unique_preserve(json_rejected + rejected + delete_rejected)
 
-        written, rejected = write_files(root, files_map)
-        deleted, delete_rejected = delete_files(root, delete_paths)
-        result.written = unique_preserve(written + deleted)
-        result.rejected = unique_preserve(rejected + delete_rejected)
+    if result.rejected:
+        restore_files(root, restore_snapshot)
+        result.valid_response = False
+        result.retry_feedback = build_response_feedback(
+            f"Invalid file paths were returned: {', '.join(result.rejected)}."
+        )
+        return result
 
-        if result.rejected:
-            restore_files(root, restore_snapshot)
-            result.valid_response = False
-            result.retry_feedback = build_response_feedback(
-                f"Invalid file paths were returned: {', '.join(result.rejected)}."
-            )
-            return result
+    changed = compute_changed_files(root, restore_snapshot)
+    result.changed_files = changed
+    if not changed and not result.rejected:
+        result.no_changes = True
 
-        wrote_from_blocks = True
-    else:
-        patch_blocks = parse_patch_blocks(response)
-        if not patch_blocks:
-            result.valid_response = False
-            result.retry_feedback = build_response_feedback(
-                "The response did not contain valid file blocks or compatible patch blocks."
-            )
-            return result
+    valid, reports, failures = validate_written_files(root, changed or result.written)
+    result.validation_reports = reports
+    result.validation_failures = failures
 
-        patch_text = "\n".join(block.rstrip("\n") for block in patch_blocks).strip()
-        if patch_text:
-            patch_text += "\n"
+    tests_ok = True
+    test_reports: list[str] = []
+    test_failures: list[str] = []
+    if valid and changed:
+        tests_ok, test_reports, test_failures = run_project_tests(root)
 
-        rel_paths, rejected = extract_patch_paths(patch_text)
-        result.rejected = rejected
+    result.test_reports = test_reports
+    result.test_failures = test_failures
+    result.validation_ok = valid and tests_ok
 
-        if rejected:
-            print(c(f"\n❌ Patch rejected: invalid paths: {', '.join(rejected)}", RED))
-            result.valid_response = False
-            result.retry_feedback = build_response_feedback(
-                f"Invalid patch paths were returned: {', '.join(rejected)}."
-            )
-            return result
-
-        if not rel_paths:
-            result.valid_response = False
-            result.retry_feedback = build_response_feedback(
-                "The patch response did not include any valid project-relative file paths."
-            )
-            return result
-
-        patch_ok, patch_error = check_unified_patch(root, patch_text)
-        if not patch_ok:
-            print(c(f"\n❌ Patch check failed: {preview_text(patch_error, max_chars=300)}", RED))
-            result.valid_response = False
-            result.retry_feedback = build_response_feedback(
-                f"Patch check failed: {preview_text(patch_error, max_chars=600)}"
-            )
-            return result
-
-        restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
-        if backup is not None:
-            extend_backup(root, backup, rel_paths)
-
-        applied, patch_error = apply_unified_patch(root, patch_text)
-        if not applied:
-            print(c(f"\n❌ Patch apply failed: {preview_text(patch_error, max_chars=300)}", RED))
-            result.valid_response = False
-            result.retry_feedback = build_response_feedback(
-                f"Patch apply failed: {preview_text(patch_error, max_chars=600)}"
-            )
-            return result
-
-        result.written = rel_paths
-        wrote_from_patch = True
-    if result.written or wrote_from_patch or wrote_from_blocks:
-        if restore_snapshot is None:
-            restore_snapshot = backup if backup is not None else backup_files(root, result.written)
-        changed = compute_changed_files(root, restore_snapshot)
-        result.changed_files = changed
-        if not changed and not result.rejected:
-            result.no_changes = True
-
-        valid, reports, failures = validate_written_files(root, changed or result.written)
-        result.validation_reports = reports
-        result.validation_failures = failures
-
-        tests_ok = True
-        test_reports: list[str] = []
-        test_failures: list[str] = []
-        if valid and changed:
-            tests_ok, test_reports, test_failures = run_project_tests(root)
-
-        result.test_reports = test_reports
-        result.test_failures = test_failures
-        result.validation_ok = valid and tests_ok
-
-        if not result.validation_ok:
-            print(c("\n❌ Validation/tests failed. Rolling back changes.", RED))
-            for failure in failures:
-                print(c(f"  - {failure}", YELLOW))
-            for failure in test_failures:
-                print(c(f"  - {preview_text(failure, max_chars=300)}", YELLOW))
-            restore_files(root, restore_snapshot)
-            result.changed_files = compute_changed_files(root, restore_snapshot)
-            result.retry_feedback = build_validation_feedback(
-                result.validation_ok,
-                result.validation_reports,
-                result.validation_failures,
-                test_reports=result.test_reports,
-                test_failures=result.test_failures,
-            )
+    if not result.validation_ok:
+        print(c("\n❌ Validation/tests failed. Rolling back changes.", RED))
+        for failure in failures:
+            print(c(f"  - {failure}", YELLOW))
+        for failure in test_failures:
+            print(c(f"  - {preview_text(failure, max_chars=300)}", YELLOW))
+        restore_files(root, restore_snapshot)
+        result.changed_files = compute_changed_files(root, restore_snapshot)
+        result.retry_feedback = build_validation_feedback(
+            result.validation_ok,
+            result.validation_reports,
+            result.validation_failures,
+            test_reports=result.test_reports,
+            test_failures=result.test_failures,
+        )
 
     return result
 
