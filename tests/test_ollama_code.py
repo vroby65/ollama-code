@@ -62,6 +62,44 @@ class OllamaCodeTests(unittest.TestCase):
 
         self.assertEqual(stats.truncated_files, ["big.py"])
 
+    def test_collect_project_context_prioritizes_requested_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text("r" * 220, encoding="utf-8")
+            (root / "index.html").write_text("i" * 180, encoding="utf-8")
+
+            context, stats = self.module.collect_project_context(
+                root,
+                max_chars=260,
+                priority_files=["index.html"],
+            )
+
+        self.assertEqual(stats.included_files, ["index.html"])
+        self.assertIn("===FILE: index.html===", context)
+
+    def test_resolve_model_context_info_uses_model_info_when_runtime_context_is_missing(self):
+        with mock.patch.object(
+            self.module,
+            "resolve_active_model",
+            return_value="test-model",
+        ), mock.patch.object(
+            self.module,
+            "discover_running_model_context_length",
+            return_value=None,
+        ), mock.patch.object(
+            self.module,
+            "fetch_model_details",
+            return_value={
+                "parameters": "",
+                "model_info": {"llama.context_length": 131072},
+            },
+        ):
+            info = self.module.resolve_model_context_info("test-model", "http://127.0.0.1:11434")
+
+        self.assertEqual(info.context_window_tokens, 131072)
+        self.assertEqual(info.source, "api-show-model-info")
+        self.assertEqual(info.max_context_tokens, 131072)
+
     def test_resolve_model_context_info_prefers_running_context(self):
         with mock.patch.object(
             self.module,
@@ -86,6 +124,44 @@ class OllamaCodeTests(unittest.TestCase):
         self.assertEqual(info.max_context_tokens, 131072)
         self.assertEqual(info.source, "api-ps")
         self.assertGreater(info.prompt_budget_chars, 0)
+
+    def test_call_ollama_sends_num_ctx_option(self):
+        captured = {}
+
+        def fake_request_json(url, payload=None, headers=None, timeout=None):
+            captured["payload"] = payload
+            return {"response": "ok"}, None
+
+        context_info = self.module.ModelContextInfo(
+            model="test-model",
+            context_window_tokens=8192,
+            max_context_tokens=131072,
+            source="api-show-model-info",
+            prompt_budget_chars=24000,
+        )
+
+        with mock.patch.object(
+            self.module,
+            "resolve_active_model",
+            return_value="test-model",
+        ), mock.patch.object(
+            self.module,
+            "request_json",
+            side_effect=fake_request_json,
+        ), mock.patch.object(
+            self.module,
+            "record_response_usage",
+        ):
+            response = self.module.call_ollama(
+                "x" * 12000,
+                "http://127.0.0.1:11434",
+                "test-model",
+                context_info=context_info,
+            )
+
+        self.assertEqual(response.strip(), "ok")
+        self.assertIn("options", captured["payload"])
+        self.assertGreater(captured["payload"]["options"]["num_ctx"], 4096)
 
     def test_run_review_workflow_retries_until_review_ok(self):
         apply_calls = []
@@ -147,7 +223,7 @@ class OllamaCodeTests(unittest.TestCase):
             target = root / "demo.py"
             target.write_text("print('old')\n", encoding="utf-8")
 
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False):
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
                 return "===FILE: demo.py===\nprint('new')\n===END===\n"
 
             with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
@@ -222,7 +298,7 @@ class OllamaCodeTests(unittest.TestCase):
             target = root / "demo.py"
             target.write_text("print('old')\n", encoding="utf-8")
 
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False):
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
                 return (
                     "===PATCH===\n"
                     "--- a/demo.py\n"
@@ -255,12 +331,52 @@ class OllamaCodeTests(unittest.TestCase):
             self.assertEqual(result.changed_files, ["demo.py"])
             self.assertEqual(target.read_text(encoding="utf-8"), "print('new')\n")
 
+    def test_apply_pass_applies_file_and_delete_blocks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keep = root / "keep.py"
+            keep.write_text("print('old')\n", encoding="utf-8")
+            old = root / "old.txt"
+            old.write_text("obsolete\n", encoding="utf-8")
+
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
+                return (
+                    "===FILE: keep.py===\n"
+                    "print('new')\n"
+                    "===END===\n"
+                    "===DELETE: old.txt===\n"
+                    "===END===\n"
+                )
+
+            with mock.patch.object(self.module, "call_ollama", side_effect=fake_call_ollama), mock.patch.object(
+                self.module,
+                "validate_written_files",
+                return_value=(True, ["keep.py (python): ok"], []),
+            ), mock.patch.object(
+                self.module,
+                "run_project_tests",
+                return_value=(True, [], []),
+            ):
+                result = self.module.apply_pass(
+                    root=root,
+                    project_text="",
+                    request="change and delete files",
+                    ollama_url="http://127.0.0.1:11434",
+                    model="test-model",
+                    backup={},
+                )
+
+            self.assertTrue(result.validation_ok)
+            self.assertEqual(result.changed_files, ["keep.py", "old.txt"])
+            self.assertEqual(keep.read_text(encoding="utf-8"), "print('new')\n")
+            self.assertFalse(old.exists())
+
     def test_apply_pass_rejects_invalid_patch_paths_before_apply(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
 
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False):
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
                 return (
                     "===PATCH===\n"
                     "--- /dev/null\n"
@@ -299,7 +415,7 @@ class OllamaCodeTests(unittest.TestCase):
             target = root / "demo.py"
             target.write_text("print('old')\n", encoding="utf-8")
 
-            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False):
+            def fake_call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=None):
                 return (
                     "===PATCH===\n"
                     "--- a/demo.py\n"

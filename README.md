@@ -153,9 +153,9 @@ If you point the tool directly at `https://ollama.com/api`, set `OLLAMA_API_KEY`
 
 `ollama-code` scans the current repository, skips internal state files, excluded directories, backup folders, binary files, symlinks, and oversized files, then builds a prompt from the remaining text files.
 
-Before each generation or review pass, the tool asks Ollama for model details and derives a conservative prompt budget from the active context window. It then truncates project context to stay within that budget.
+Before each generation or review pass, the tool asks Ollama for model details, derives a prompt budget from the available context window, prioritizes the most relevant files first, and requests an appropriate `num_ctx` for the call.
 
-The main model answers with unified diff patch blocks in a strict format. The tool applies those patches, validates changed files, runs tests when available, asks the review model to ratify the resulting diff, and retries with explicit validation/review feedback when needed.
+The main model answers with complete file blocks for updated files and delete blocks for removals. The tool writes those file states directly, validates changed files, runs tests when available, asks the review model to ratify the resulting diff, and retries with explicit validation/review feedback when needed.
 
 The workflow is:
 

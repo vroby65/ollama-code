@@ -5,6 +5,7 @@ import argparse
 import atexit
 import difflib
 import json
+import math
 import os
 import re
 import readline
@@ -204,6 +205,10 @@ SKIP_REASON_LABELS = {
 BLOCK_RE = re.compile(
     r"^===FILE:\s*(.*?)\s*===\n(.*?)^===END===\s*$",
     re.MULTILINE | re.DOTALL,
+)
+DELETE_BLOCK_RE = re.compile(
+    r"^===DELETE:\s*(.*?)\s*===\n^===END===\s*$",
+    re.MULTILINE,
 )
 PATCH_BLOCK_RE = re.compile(
     r"^===PATCH===\n(.*?)^===END===\s*$",
@@ -855,7 +860,11 @@ def scan_project_files(root: Path) -> tuple[list[Path], dict[str, int], dict[str
     return sorted(files, key=lambda p: str(p.relative_to(root))), skipped_counts, skipped_examples
 
 
-def collect_project_context(root: Path, max_chars: int | None = None) -> tuple[str, ProjectContextStats]:
+def collect_project_context(
+    root: Path,
+    max_chars: int | None = None,
+    priority_files: list[str] | None = None,
+) -> tuple[str, ProjectContextStats]:
     chunks = []
     total = 0
     files, skipped_counts, skipped_examples = scan_project_files(root)
@@ -864,6 +873,24 @@ def collect_project_context(root: Path, max_chars: int | None = None) -> tuple[s
         skipped_examples=skipped_examples,
     )
     context_limit = MAX_PROMPT_CHARS if max_chars is None else max(0, min(MAX_PROMPT_CHARS, max_chars))
+    priority_files = unique_preserve(priority_files or [])
+    if priority_files:
+        by_rel = {str(path.relative_to(root)): path for path in files}
+        prioritized: list[Path] = []
+        seen: set[str] = set()
+        for rel in priority_files:
+            path = by_rel.get(rel)
+            if path is None or rel in seen:
+                continue
+            prioritized.append(path)
+            seen.add(rel)
+
+        for path in files:
+            rel = str(path.relative_to(root))
+            if rel in seen:
+                continue
+            prioritized.append(path)
+        files = prioritized
 
     for path in files:
         rel = str(path.relative_to(root))
@@ -1626,11 +1653,11 @@ def resolve_model_context_info(
     elif configured_num_ctx:
         context_window_tokens = configured_num_ctx
         source = "api-show-parameters"
+    elif max_context:
+        context_window_tokens = max_context
+        source = "api-show-model-info"
     else:
         context_window_tokens = DEFAULT_CONTEXT_WINDOW_TOKENS
-        if max_context and max_context < context_window_tokens:
-            context_window_tokens = max_context
-            source = "api-show-model-info"
 
     if max_context:
         context_window_tokens = min(context_window_tokens, max_context)
@@ -1652,13 +1679,36 @@ def collect_context_for_prompt(
     model: str | None,
     ollama_url: str | None,
     prompt_factory,
+    priority_files: list[str] | None = None,
 ) -> tuple[str, ProjectContextStats, ModelContextInfo]:
     context_info = resolve_model_context_info(model, ollama_url)
     empty_prompt = prompt_factory("")
     available_for_project = context_info.prompt_budget_chars - len(empty_prompt)
     project_budget = max(0, min(MAX_PROMPT_CHARS, available_for_project))
-    project_text, stats = collect_project_context(root, max_chars=project_budget)
+    project_text, stats = collect_project_context(
+        root,
+        max_chars=project_budget,
+        priority_files=priority_files,
+    )
     return project_text, stats, context_info
+
+
+def estimate_prompt_tokens(prompt: str) -> int:
+    return max(1, math.ceil(len(prompt) / APPROX_CHARS_PER_TOKEN))
+
+
+def desired_num_ctx_for_prompt(prompt: str, context_info: ModelContextInfo) -> int:
+    prompt_tokens = estimate_prompt_tokens(prompt)
+    desired = max(
+        DEFAULT_CONTEXT_WINDOW_TOKENS,
+        math.ceil(prompt_tokens / PROMPT_CONTEXT_USAGE_RATIO),
+        prompt_tokens + 2048,
+    )
+
+    max_allowed = context_info.max_context_tokens or context_info.context_window_tokens
+    if max_allowed > 0:
+        return max(1024, min(desired, max_allowed))
+    return max(1024, desired)
 
 
 def discover_ollama_models(ollama_url: str | None = None) -> list[str]:
@@ -1949,7 +1999,7 @@ def build_response_feedback(message: str) -> str:
         "RESULT: ERRORS\n\n"
         "MODEL RESPONSE ERROR:\n"
         f"{message.strip()}\n\n"
-        "Return only valid unified diff patches or NO_CHANGES."
+        "Return only valid file blocks, delete blocks, or NO_CHANGES."
     ).strip()
 
 
@@ -1986,14 +2036,12 @@ def build_code_prompt(
     return (
         "Role: terminal coding agent.\n"
         f"Pass objective: {objective}\n"
-        "Reply only with unified diff patches for modified/new/deleted files.\n\n"
+        "Reply only with full file blocks for modified/new files and delete blocks for removals.\n\n"
         "MANDATORY FORMAT:\n"
-        "===PATCH===\n"
-        "--- a/relative/path\n"
-        "+++ b/relative/path\n"
-        "@@ -old,+new @@\n"
-        "-old line\n"
-        "+new line\n"
+        "===FILE: relative/path===\n"
+        "full file content\n"
+        "===END===\n\n"
+        "===DELETE: relative/path===\n"
         "===END===\n\n"
         "RULES:\n"
         "- keep responses coherent and deterministic\n"
@@ -2002,13 +2050,12 @@ def build_code_prompt(
         "- no explanation text\n"
         "- no markdown\n"
         "- no ``` blocks\n"
-        "- return only patch blocks\n"
-        "- use only project-relative paths with a/ and b/ prefixes\n"
+        "- return only file blocks and delete blocks\n"
+        "- use only project-relative paths\n"
         "- do not touch ollama-code internal files\n"
         "- do not return unchanged files\n"
-        "- each patch block must be a valid unified diff\n"
-        "- for new files use '--- /dev/null' and '+++ b/path'\n"
-        "- for deletions use '--- a/path' and '+++ /dev/null'\n"
+        "- every changed file must include the complete final file content\n"
+        "- every delete block must remove exactly one existing project file\n"
         "- always close each block with a separate line containing exactly ===END===\n"
         "- if nothing needs to change, return exactly: NO_CHANGES\n\n"
         f"{history_section}"
@@ -2299,6 +2346,7 @@ def call_ollama(
     ollama_url: str,
     model: str | None,
     plan_mode: bool = False,
+    context_info: ModelContextInfo | None = None,
 ) -> str:
     active_model = resolve_active_model(model, ollama_url)
     last_error = ""
@@ -2338,10 +2386,17 @@ def call_ollama(
         MUTED,
     ))
 
+    resolved_context_info = context_info
+    if resolved_context_info is None:
+        resolved_context_info = resolve_model_context_info(active_model, ollama_url)
+
     payload = {
         "model": active_model,
         "prompt": prompt,
         "stream": False,
+        "options": {
+            "num_ctx": desired_num_ctx_for_prompt(prompt, resolved_context_info),
+        },
     }
 
     for attempt in range(1, OLLAMA_MAX_ATTEMPTS + 1):
@@ -2420,6 +2475,15 @@ def parse_file_blocks(text: str) -> Dict[str, str]:
         if path:
             result[path] = content.rstrip("\n") + "\n"
     return result
+
+
+def parse_delete_blocks(text: str) -> list[str]:
+    deleted: list[str] = []
+    for path in DELETE_BLOCK_RE.findall(text):
+        rel = path.strip()
+        if rel:
+            deleted.append(rel)
+    return unique_preserve(deleted)
 
 
 def parse_patch_blocks(text: str) -> list[str]:
@@ -2642,6 +2706,23 @@ def write_files(root: Path, files_map: Dict[str, str]) -> tuple[list[str], list[
         written.append(rel)
 
     return written, rejected
+
+
+def delete_files(root: Path, rel_paths: list[str]) -> tuple[list[str], list[str]]:
+    deleted: list[str] = []
+    rejected: list[str] = []
+
+    for rel in rel_paths:
+        if not is_valid_relpath(rel):
+            rejected.append(rel)
+            continue
+
+        dest = root / rel
+        if dest.exists():
+            dest.unlink()
+        deleted.append(rel)
+
+    return deleted, rejected
 
 
 def git_add_written_files(written: list[str]) -> None:
@@ -2992,6 +3073,7 @@ def apply_pass(
     validation_text: str = "",
     session_diff: str = "",
     backup: dict[str, str | None] | None = None,
+    context_info: ModelContextInfo | None = None,
 ) -> AppliedPassResult:
     objective = "deliver a complete first implementation that matches the request"
     if review_text.strip():
@@ -3010,7 +3092,7 @@ def apply_pass(
         session_diff=session_diff,
     )
 
-    response = call_ollama(prompt, ollama_url, model, plan_mode=False)
+    response = call_ollama(prompt, ollama_url, model, plan_mode=False, context_info=context_info)
     save_last_response(root, response)
 
     result = AppliedPassResult(
@@ -3027,9 +3109,42 @@ def apply_pass(
         result.no_changes = True
         return result
 
-    patch_blocks = parse_patch_blocks(response)
+    files_map = parse_file_blocks(response)
+    delete_paths = parse_delete_blocks(response)
     wrote_from_patch = False
-    if patch_blocks:
+    restore_snapshot: dict[str, str | None] | None = None
+    wrote_from_blocks = False
+
+    if files_map or delete_paths:
+        result.files_map = files_map
+        rel_paths = unique_preserve(list(files_map.keys()) + delete_paths)
+        restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
+        if backup is not None:
+            extend_backup(root, backup, rel_paths)
+
+        written, rejected = write_files(root, files_map)
+        deleted, delete_rejected = delete_files(root, delete_paths)
+        result.written = unique_preserve(written + deleted)
+        result.rejected = unique_preserve(rejected + delete_rejected)
+
+        if result.rejected:
+            restore_files(root, restore_snapshot)
+            result.valid_response = False
+            result.retry_feedback = build_response_feedback(
+                f"Invalid file paths were returned: {', '.join(result.rejected)}."
+            )
+            return result
+
+        wrote_from_blocks = True
+    else:
+        patch_blocks = parse_patch_blocks(response)
+        if not patch_blocks:
+            result.valid_response = False
+            result.retry_feedback = build_response_feedback(
+                "The response did not contain valid file blocks or compatible patch blocks."
+            )
+            return result
+
         patch_text = "\n".join(block.rstrip("\n") for block in patch_blocks).strip()
         if patch_text:
             patch_text += "\n"
@@ -3076,27 +3191,9 @@ def apply_pass(
 
         result.written = rel_paths
         wrote_from_patch = True
-    else:
-        files_map = parse_file_blocks(response)
-        result.files_map = files_map
-
-        if not files_map:
-            result.valid_response = False
-            result.retry_feedback = build_response_feedback(
-                "The response did not contain valid patch blocks or file blocks."
-            )
-            return result
-
-        rel_paths = list(files_map.keys())
-        restore_snapshot = backup if backup is not None else backup_files(root, rel_paths)
-        if backup is not None:
-            extend_backup(root, backup, rel_paths)
-
-        written, rejected = write_files(root, files_map)
-        result.written = written
-        result.rejected = rejected
-
-    if result.written or wrote_from_patch:
+    if result.written or wrote_from_patch or wrote_from_blocks:
+        if restore_snapshot is None:
+            restore_snapshot = backup if backup is not None else backup_files(root, result.written)
         changed = compute_changed_files(root, restore_snapshot)
         result.changed_files = changed
         if not changed and not result.rejected:
@@ -3144,6 +3241,33 @@ def review_verdict_ok(review_text: str) -> bool:
             verdict = stripped.split(":", 1)[1].strip().upper()
             return verdict == "OK"
     return False
+
+
+def parse_review_target_files(review_text: str) -> list[str]:
+    files: list[str] = []
+    in_files_section = False
+
+    for line in review_text.splitlines():
+        stripped = line.strip()
+        upper = stripped.upper()
+
+        if upper.startswith("FILES:"):
+            in_files_section = True
+            continue
+
+        if in_files_section and re.match(r"^[A-Z][A-Z ]+:\s*$", stripped):
+            break
+
+        if not in_files_section or not stripped.startswith("-"):
+            continue
+
+        candidate = stripped[1:].strip()
+        if candidate.lower() == "none":
+            continue
+        if is_valid_relpath(candidate):
+            files.append(candidate)
+
+    return unique_preserve(files)
 
 
 def normalize_review_feedback(review_text: str) -> str:
@@ -3199,7 +3323,15 @@ def run_review_workflow(
         )
         main_context_shown = maybe_show_context_summary(main_context_shown, plan_stats, plan_context_info)
         plan_prompt = build_plan_prompt(plan_project_text, request, request_history)
-        plan_text = clean_plan_output(call_ollama(plan_prompt, ollama_url, main_model, plan_mode=True))
+        plan_text = clean_plan_output(
+            call_ollama(
+                plan_prompt,
+                ollama_url,
+                main_model,
+                plan_mode=True,
+                context_info=plan_context_info,
+            )
+        )
         if plan_text:
             print(c("\n📋 Plan generated.", GREEN))
 
@@ -3208,6 +3340,7 @@ def run_review_workflow(
     for attempt in range(1, WORKFLOW_MAX_ATTEMPTS + 1):
         print(c(f"\n🛠️ Main pass {attempt}/{WORKFLOW_MAX_ATTEMPTS}", CYAN))
         current_changed = compute_changed_files(root, backup_map)
+        main_priority_files = unique_preserve(current_changed + parse_review_target_files(review_feedback))
         session_diff = build_session_diff(root, backup_map, current_changed)
         code_factory = lambda project_text: build_code_prompt(
             project_text=project_text,
@@ -3232,6 +3365,7 @@ def run_review_workflow(
             model=main_model,
             ollama_url=ollama_url,
             prompt_factory=code_factory,
+            priority_files=main_priority_files,
         )
         main_context_shown = maybe_show_context_summary(main_context_shown, stats, main_context_info)
 
@@ -3247,6 +3381,7 @@ def run_review_workflow(
             validation_text=validation_feedback,
             session_diff=session_diff,
             backup=backup_map,
+            context_info=main_context_info,
         )
         changed = compute_changed_files(root, backup_map)
 
@@ -3312,6 +3447,7 @@ def run_review_workflow(
             model=resolve_review_model(review_model, main_model, ollama_url),
             ollama_url=ollama_url,
             prompt_factory=review_factory,
+            priority_files=changed,
         )
         review_context_shown = maybe_show_context_summary(review_context_shown, review_stats, review_context_info)
 
@@ -3330,7 +3466,13 @@ def run_review_workflow(
             session_diff=build_session_diff(root, backup_map, changed),
         )
         review_text = normalize_review_feedback(
-            call_ollama(review_prompt, ollama_url, resolve_review_model(review_model, main_model, ollama_url), plan_mode=False)
+            call_ollama(
+                review_prompt,
+                ollama_url,
+                resolve_review_model(review_model, main_model, ollama_url),
+                plan_mode=False,
+                context_info=review_context_info,
+            )
         )
 
         if review_verdict_ok(review_text):
