@@ -83,19 +83,17 @@ TERM_STYLES = {
     "error": "38;5;203",
     "muted": "38;5;244",
     "note": "38;5;180",
+    "logo": "96;48;5;54",
 }
 
-OLLAMA_BANNER = [
-    "        /\\\\",
-    "   /\\\\  /  \\\\\\\\",
-    "  /  \\\\|    ||",
-    " / /\\\\ \\\\   ||   OLLAMA CODE",
-    "/_/  \\\\_\\\\  ||   oc",
-    "\\\\ \\\\  / /  ||",
-    " \\\\ \\\\/ /   ||",
-    "  \\\\  /    //",
-    "   \\\\/____//",
-]
+OLLAMA_BANNER = r"""
+╭────────╮     ╭──────╮
+│ ╭────╮ │   ╭─╯ ╭────╯
+│ │    │ │   │   │
+│ │    │ │   │   │
+│ ╰────╯ │   ╰─╮ ╰────╮
+╰────────╯     ╰──────╯
+""".strip("\n").splitlines()
 
 SPINNER_FRAMES = [
     "[=     ]",
@@ -125,8 +123,8 @@ def println(message=""):
 def explain_missing_path(exc, fallback=None):
     missing = getattr(exc, "filename", None) or fallback
     if missing:
-        return f"file o directory non trovato: {missing}"
-    return "file o directory non trovato"
+        return f"file or directory not found: {missing}"
+    return "file or directory not found"
 
 
 def supports_color(stream=None):
@@ -190,7 +188,7 @@ def format_url(url):
 
 
 def format_status(ok):
-    return ok_text("ok") if ok else error_text("errore")
+    return ok_text("ok") if ok else error_text("error")
 
 
 def info_text(text):
@@ -214,10 +212,8 @@ def format_check_line(check):
 
 def print_ollama_banner(config):
     println(paint(rule("="), TERM_STYLES["panel"]))
-    for idx, line in enumerate(OLLAMA_BANNER):
-        color = TERM_STYLES["model"] if "OLLAMA CODE" in line or line.strip() == "oc" else TERM_STYLES["accent"]
-        weight = TERM_STYLES["bold"] if idx < 5 or "OLLAMA CODE" in line or line.strip() == "oc" else TERM_STYLES["panel"]
-        println(paint(line, weight, color))
+    for line in OLLAMA_BANNER:
+        println(paint(line, TERM_STYLES["logo"]))
     println("  " + paint(f"{APP_NAME} ({APP_ABBR})", TERM_STYLES["bold"], TERM_STYLES["prompt"]))
     println(
         "  "
@@ -260,7 +256,7 @@ class AnimatedStatus:
             time.sleep(0.12)
 
     def _finish_line(self, ok):
-        status = ok_text("ok") if ok else error_text("errore")
+        status = ok_text("ok") if ok else error_text("error")
         line = (
             paint("[done]", TERM_STYLES["panel"])
             + " "
@@ -294,7 +290,7 @@ def parse_args(argv):
         if arg == "-r":
             reset_config = True
             continue
-        raise SystemExit(f"Uso: {Path(argv[0]).name} [-r]")
+        raise SystemExit(f"Usage: {Path(argv[0]).name} [-r]")
     return {"reset_config": reset_config}
 
 
@@ -303,21 +299,21 @@ def prompt_input(label, default=None, allow_empty=False):
         try:
             value = input(format_prompt(label, default if default else None)).strip()
         except EOFError:
-            raise SystemExit("\nInput terminato.")
+            raise SystemExit("\nInput ended.")
         except KeyboardInterrupt:
-            raise SystemExit("\nInterrotto.")
+            raise SystemExit("\nInterrupted.")
         if value:
             return value
         if default is not None:
             return default
         if allow_empty:
             return ""
-        println(warning_text("Valore obbligatorio."))
+        println(warning_text("A value is required."))
 
 
 def prompt_multiline(label):
     println(section_title(label))
-    println(muted("Termina con una riga vuota."))
+    println(muted("Finish with an empty line."))
     lines = []
     while True:
         try:
@@ -325,11 +321,11 @@ def prompt_multiline(label):
         except EOFError:
             break
         except KeyboardInterrupt:
-            raise SystemExit("\nInterrotto.")
+            raise SystemExit("\nInterrupted.")
         if not line.strip() and lines:
             break
         if not line.strip() and not lines:
-            println(warning_text("Inserisci almeno una riga."))
+            println(warning_text("Enter at least one line."))
             continue
         lines.append(line)
     return "\n".join(lines).strip()
@@ -353,14 +349,14 @@ def open_file_in_editor(repo_path, target_path):
     editor_cmd = resolve_editor_command()
     if not editor_cmd:
         raise RuntimeError(
-            "Nessun editor disponibile. Imposta $VISUAL o $EDITOR, oppure installa nano/vim/vi o Notepad su Windows."
+            "No editor available. Set $VISUAL or $EDITOR, or install nano/vim/vi or Notepad on Windows."
         )
 
     if not target_path.exists():
         target_path.write_text("", encoding="utf-8")
 
     println(
-        info_text("Apro l'editor:")
+        info_text("Opening editor:")
         + " "
         + paint(" ".join(editor_cmd), TERM_STYLES["bold"], TERM_STYLES["prompt"])
         + " "
@@ -370,10 +366,10 @@ def open_file_in_editor(repo_path, target_path):
         completed = subprocess.run([*editor_cmd, str(target_path)], cwd=str(repo_path))
     except FileNotFoundError as exc:
         raise RuntimeError(
-            f"Impossibile avviare l'editor ({' '.join(editor_cmd)}): {explain_missing_path(exc, editor_cmd[0])}"
+            f"Unable to start editor ({' '.join(editor_cmd)}): {explain_missing_path(exc, editor_cmd[0])}"
         ) from exc
     if completed.returncode != 0:
-        raise RuntimeError(f"L'editor e' terminato con codice {completed.returncode}.")
+        raise RuntimeError(f"The editor exited with code {completed.returncode}.")
 
 
 def load_specs_prompt(repo_path):
@@ -381,14 +377,14 @@ def load_specs_prompt(repo_path):
     while True:
         if sys.stdin.isatty() and sys.stdout.isatty():
             if specs_path.exists():
-                println(info_text("Apro le specifiche per modifica:") + f" {format_path(SPECS_FILE)}")
+                println(info_text("Opening specs for editing:") + f" {format_path(SPECS_FILE)}")
             else:
-                println(warning_text(f"{SPECS_FILE} non trovato."))
+                println(warning_text(f"{SPECS_FILE} not found."))
             open_file_in_editor(repo_path, specs_path)
 
         if not specs_path.exists():
             raise SystemExit(
-                f"{SPECS_FILE} non trovato. Crealo nel workspace oppure esegui {APP_ABBR} in un terminale interattivo."
+                f"{SPECS_FILE} not found. Create it in the workspace or run {APP_ABBR} in an interactive terminal."
             )
 
         try:
@@ -396,16 +392,16 @@ def load_specs_prompt(repo_path):
         except FileNotFoundError:
             content = ""
         except OSError as exc:
-            raise RuntimeError(f"Impossibile leggere {SPECS_FILE}: {explain_missing_path(exc, specs_path)}") from exc
+            raise RuntimeError(f"Unable to read {SPECS_FILE}: {explain_missing_path(exc, specs_path)}") from exc
 
         if content:
-            println(info_text("Specifiche caricate da") + f" {format_path(SPECS_FILE)}.")
+            println(info_text("Specs loaded from") + f" {format_path(SPECS_FILE)}.")
             return content
 
         if not sys.stdin.isatty() or not sys.stdout.isatty():
-            raise SystemExit(f"{SPECS_FILE} vuoto. Compilalo nel workspace oppure esegui {APP_ABBR} in un terminale interattivo.")
+            raise SystemExit(f"{SPECS_FILE} is empty. Fill it in the workspace or run {APP_ABBR} in an interactive terminal.")
 
-        println(warning_text(f"{SPECS_FILE} e' vuoto."))
+        println(warning_text(f"{SPECS_FILE} is empty."))
 
 
 def create_readme(repo_path):
@@ -448,30 +444,30 @@ def create_readme(repo_path):
     try:
         readme_path.write_text(content, encoding="utf-8")
     except OSError as exc:
-        raise RuntimeError(f"Impossibile scrivere {README_FILE}: {explain_missing_path(exc, readme_path)}") from exc
+        raise RuntimeError(f"Unable to write {README_FILE}: {explain_missing_path(exc, readme_path)}") from exc
     return readme_path
 
 
 def fetch_available_models(base_url):
     request = urllib.request.Request(f"{base_url}/api/tags", method="GET")
     try:
-        with AnimatedStatus("Scansione modelli Ollama"):
+        with AnimatedStatus("Scanning Ollama models"):
             with urllib.request.urlopen(request, timeout=10) as response:
                 raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Errore HTTP Ollama {exc.code}: {body}") from exc
+        raise RuntimeError(f"Ollama HTTP error {exc.code}: {body}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Impossibile contattare Ollama su {base_url}: {exc}") from exc
+        raise RuntimeError(f"Unable to contact Ollama at {base_url}: {exc}") from exc
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Risposta non valida da Ollama per la lista modelli.") from exc
+        raise RuntimeError("Invalid Ollama response for the model list.") from exc
 
     models = data.get("models", [])
     if not isinstance(models, list):
-        raise RuntimeError("Risposta Ollama non valida: campo models assente o non valido.")
+        raise RuntimeError("Invalid Ollama response: missing or invalid models field.")
 
     names = []
     for item in models:
@@ -489,42 +485,42 @@ def prompt_model_choice(base_url, default=None):
         models = fetch_available_models(base_url)
     except Exception as exc:
         println(
-            warning_text("Avviso:")
-            + f" impossibile leggere i modelli disponibili da {format_url(base_url)}: {exc}"
+            warning_text("Warning:")
+            + f" unable to read available models from {format_url(base_url)}: {exc}"
         )
-        return prompt_input("Modello Ollama", default_model)
+        return prompt_input("Ollama model", default_model)
 
     if not models:
-        println(warning_text("Avviso:") + " Ollama non ha restituito modelli disponibili.")
-        return prompt_input("Modello Ollama", default_model)
+        println(warning_text("Warning:") + " Ollama did not return any available models.")
+        return prompt_input("Ollama model", default_model)
 
-    println(section_title("Modelli Ollama disponibili"))
+    println(section_title("Available Ollama models"))
     for idx, name in enumerate(models, start=1):
         entry = f"{paint(str(idx), TERM_STYLES['note'])}. {format_model_name(name)}"
         if name == default_model:
-            entry += " " + muted("(predefinito)")
+            entry += " " + muted("(default)")
         println(entry)
 
     default_choice = default_model if default_model in models else models[0]
     default_index = models.index(default_choice) + 1
     while True:
         try:
-            value = input(format_prompt("Scegli il modello per numero o nome", default_index)).strip()
+            value = input(format_prompt("Choose the model by number or name", default_index)).strip()
         except EOFError:
-            raise SystemExit("\nInput terminato.")
+            raise SystemExit("\nInput ended.")
         except KeyboardInterrupt:
-            raise SystemExit("\nInterrotto.")
+            raise SystemExit("\nInterrupted.")
         if not value:
             return default_choice
         if value.isdigit():
             choice = int(value)
             if 1 <= choice <= len(models):
                 return models[choice - 1]
-            println(warning_text("Numero non valido."))
+            println(warning_text("Invalid number."))
             continue
         if value in models:
             return value
-        println(warning_text("Scelta non valida.") + " Inserisci un numero o uno dei nomi elencati.")
+        println(warning_text("Invalid choice.") + " Enter a number or one of the listed names.")
 
 
 def run(cmd, cwd, check=True, timeout=None):
@@ -538,13 +534,13 @@ def run(cmd, cwd, check=True, timeout=None):
         )
     except FileNotFoundError as exc:
         raise RuntimeError(
-            f"Impossibile eseguire il comando ({' '.join(cmd)}): {explain_missing_path(exc, cmd[0])}"
+            f"Unable to run command ({' '.join(cmd)}): {explain_missing_path(exc, cmd[0])}"
         ) from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(f"Comando scaduto ({' '.join(cmd)}).") from exc
+        raise RuntimeError(f"Command timed out ({' '.join(cmd)}).") from exc
     if check and result.returncode != 0:
         raise RuntimeError(
-            f"Comando fallito ({' '.join(cmd)}):\n{result.stderr.strip() or result.stdout.strip()}"
+            f"Command failed ({' '.join(cmd)}):\n{result.stderr.strip() or result.stdout.strip()}"
         )
     return result
 
@@ -553,10 +549,10 @@ def load_or_create_config(repo_path):
     config_path = repo_path / CONFIG_FILE
     created = False
     if not config_path.exists():
-        println(warning_text("Configurazione non trovata."))
+        println(warning_text("Configuration not found."))
         base_url = prompt_input("Base URL Ollama", DEFAULT_BASE_URL).rstrip("/")
         model = prompt_model_choice(base_url, DEFAULT_MODEL)
-        temperature_raw = prompt_input("Temperatura", str(DEFAULT_TEMPERATURE))
+        temperature_raw = prompt_input("Temperature", str(DEFAULT_TEMPERATURE))
         try:
             temperature = float(temperature_raw)
         except ValueError:
@@ -569,15 +565,15 @@ def load_or_create_config(repo_path):
         try:
             config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
         except OSError as exc:
-            raise RuntimeError(f"Impossibile salvare {CONFIG_FILE}: {explain_missing_path(exc, config_path)}") from exc
+            raise RuntimeError(f"Unable to save {CONFIG_FILE}: {explain_missing_path(exc, config_path)}") from exc
         created = True
     else:
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
         except FileNotFoundError as exc:
-            raise RuntimeError(f"Configurazione sparita durante la lettura: {explain_missing_path(exc, config_path)}") from exc
+            raise RuntimeError(f"Configuration disappeared while reading it: {explain_missing_path(exc, config_path)}") from exc
         except json.JSONDecodeError as exc:
-            raise SystemExit(f"{CONFIG_FILE} non valido: {exc}")
+            raise SystemExit(f"{CONFIG_FILE} is invalid: {exc}")
     config.setdefault("base_url", DEFAULT_BASE_URL)
     config.setdefault("model", DEFAULT_MODEL)
     config.setdefault("temperature", DEFAULT_TEMPERATURE)
@@ -595,8 +591,8 @@ def reset_config_file(repo_path):
         try:
             config_path.unlink()
         except OSError as exc:
-            raise RuntimeError(f"Impossibile rimuovere {CONFIG_FILE}: {explain_missing_path(exc, config_path)}") from exc
-        println(info_text("Configurazione rimossa:") + f" {format_path(CONFIG_FILE)}")
+            raise RuntimeError(f"Unable to remove {CONFIG_FILE}: {explain_missing_path(exc, config_path)}") from exc
+        println(info_text("Configuration removed:") + f" {format_path(CONFIG_FILE)}")
 
 
 def is_code_file(path):
@@ -677,8 +673,8 @@ def collect_workspace_context(repo_path):
         total_chars += len(entry)
         included_files += 1
 
-    tree = "\n".join(files) if files else "(vuoto)"
-    excerpts = "\n\n".join(snippets) if snippets else "(nessun file testuale rilevante)"
+    tree = "\n".join(files) if files else "(empty)"
+    excerpts = "\n\n".join(snippets) if snippets else "(no relevant text files)"
     return {
         "tree": tree,
         "excerpts": excerpts,
@@ -705,18 +701,18 @@ def ollama_chat(config, system_prompt, user_prompt):
         with urllib.request.urlopen(request, timeout=MODEL_REQUEST_TIMEOUT) as response:
             raw = response.read().decode("utf-8")
     except (TimeoutError, socket.timeout) as exc:
-        raise RuntimeError(f"Timeout Ollama dopo {MODEL_REQUEST_TIMEOUT} secondi.") from exc
+        raise RuntimeError(f"Ollama timed out after {MODEL_REQUEST_TIMEOUT} seconds.") from exc
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Errore HTTP Ollama {exc.code}: {body}") from exc
+        raise RuntimeError(f"Ollama HTTP error {exc.code}: {body}") from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Impossibile contattare Ollama su {config['base_url']}: {exc}") from exc
+        raise RuntimeError(f"Unable to contact Ollama at {config['base_url']}: {exc}") from exc
 
     data = json.loads(raw)
     message = data.get("message", {})
     content = message.get("content", "").strip()
     if not content:
-        raise RuntimeError("Risposta Ollama vuota.")
+        raise RuntimeError("Empty Ollama response.")
     return content
 
 
@@ -761,7 +757,7 @@ def extract_json(text):
                         return json.loads(fragment)
                     except json.JSONDecodeError:
                         break
-    raise RuntimeError(f"Impossibile estrarre JSON dalla risposta del modello:\n{text}")
+    raise RuntimeError(f"Unable to extract JSON from the model response:\n{text}")
 
 
 def compact_error_message(exc):
@@ -783,25 +779,25 @@ def run_model_step(step_name, operation):
                 break
             println(
                 error_text(step_name)
-                + f": tentativo {attempt}/{MODEL_STEP_RETRIES} fallito: {compact_error_message(exc)}"
+                + f": attempt {attempt}/{MODEL_STEP_RETRIES} failed: {compact_error_message(exc)}"
             )
-            println(info_text(f"Nuovo tentativo tra {MODEL_RETRY_DELAY_SECONDS} secondi...\n"))
+            println(info_text(f"Retrying in {MODEL_RETRY_DELAY_SECONDS} seconds...\n"))
             time.sleep(MODEL_RETRY_DELAY_SECONDS)
     raise RuntimeError(
-        f"{step_name} fallito dopo {MODEL_STEP_RETRIES} tentativi: {compact_error_message(last_exc)}"
+        f"{step_name} failed after {MODEL_STEP_RETRIES} attempts: {compact_error_message(last_exc)}"
     ) from last_exc
 
 
 def format_validation_for_prompt(validation):
     if not validation:
-        return "Nessun controllo precedente."
+        return "No previous check."
     if not validation.get("checks"):
-        return "Nessun controllo automatico applicabile nella iterazione precedente."
+        return "No automatic checks applied in the previous iteration."
 
-    lines = [f"Esito precedente: {'ok' if validation['ok'] else 'errore'}"]
+    lines = [f"Previous result: {'ok' if validation['ok'] else 'error'}"]
     for check in validation["checks"]:
-        status = "ok" if check.get("ok") else "errore"
-        lines.append(f"{check.get('name', 'controllo')}: {status}")
+        status = "ok" if check.get("ok") else "error"
+        lines.append(f"{check.get('name', 'check')}: {status}")
         details = str(check.get("details", "")).strip()
         if details:
             lines.append(details)
@@ -811,45 +807,45 @@ def format_validation_for_prompt(validation):
 def build_verification(config, user_prompt, workspace_context, initial_validation):
     system_prompt = textwrap.dedent(
         """
-        Sei un agente di analisi del codice.
-        Devi leggere prompt utente, controlli automatici e contenuto del workspace.
-        Restituisci solo JSON valido con questo schema:
+        You are a code analysis agent.
+        Read the user prompt, automatic checks, and workspace content.
+        Return only valid JSON with this schema:
         {
-          "summary": "breve sintesi dello stato attuale",
-          "observations": ["osservazione 1", "osservazione 2"]
+          "summary": "short summary of the current state",
+          "observations": ["observation 1", "observation 2"]
         }
-        Regole:
-        - Descrivi prima cosa succede adesso rispetto al prompt.
-        - Evidenzia anomalie, errori o mancanze gia' presenti.
-        - Non proporre ancora un piano di modifica.
-        - Se il prompt parla di verificare anomalie o problemi, considera implicita anche la successiva correzione.
-        - Scrivi in italiano.
-        - Nessun testo fuori dal JSON.
+        Rules:
+        - First describe what currently happens relative to the prompt.
+        - Highlight existing anomalies, errors, or gaps.
+        - Do not propose a change plan yet.
+        - If the prompt asks to verify anomalies or problems, treat the subsequent fix as implicit.
+        - Write in English.
+        - No text outside the JSON.
         """
     ).strip()
     user_message = textwrap.dedent(
         f"""
-        Prompt utente:
+        User prompt:
         {user_prompt}
 
-        Controlli automatici iniziali:
+        Initial automatic checks:
         {format_validation_for_prompt(initial_validation)}
 
-        Albero workspace:
+        Workspace tree:
         {workspace_context['tree']}
 
-        Estratti file:
+        File excerpts:
         {workspace_context['excerpts']}
         """
     ).strip()
     response = ollama_chat(config, system_prompt, user_message)
     data = extract_json(response)
     if not isinstance(data, dict):
-        raise RuntimeError("La verifica iniziale non e' un oggetto JSON valido.")
+        raise RuntimeError("The initial verification is not a valid JSON object.")
     observations = data.get("observations", [])
     if not isinstance(observations, list):
         observations = [str(observations)]
-    summary = str(data.get("summary", "")).strip() or "Nessuna sintesi disponibile."
+    summary = str(data.get("summary", "")).strip() or "No summary available."
     return {
         "summary": summary,
         "observations": [str(item).strip() for item in observations if str(item).strip()],
@@ -859,49 +855,49 @@ def build_verification(config, user_prompt, workspace_context, initial_validatio
 def build_plan(config, user_prompt, workspace_context, iteration, validation=None, verification=None, bootstrap_mode=False):
     system_prompt = textwrap.dedent(
         """
-        Sei un agente di pianificazione per sviluppo software.
-        Devi leggere prompt utente, verifica iniziale e contenuto del workspace.
-        Restituisci solo JSON valido con questo schema:
+        You are a software development planning agent.
+        Read the user prompt, initial verification, and workspace content.
+        Return only valid JSON with this schema:
         {
-          "plan": ["punto 1", "punto 2", "punto 3"]
+          "plan": ["item 1", "item 2", "item 3"]
         }
-        Regole:
-        - Tra 3 e 6 punti.
-        - Ogni punto deve essere concreto e operativo.
-        - Scrivi in italiano.
-        - Mantieni la soluzione il piu' semplice possibile.
-        - Se il prompt parla di verificare anomalie o problemi, considera implicita anche la correzione salvo istruzioni contrarie.
-        - Se esiste un report precedente o un controllo fallito, usalo per correggere prima i problemi.
-        - Se il workspace non contiene ancora codice, non analizzare errori inesistenti: pianifica la costruzione iniziale da zero.
-        - Nessun testo fuori dal JSON.
+        Rules:
+        - Use 3 to 6 items.
+        - Each item must be concrete and operational.
+        - Write in English.
+        - Keep the solution as simple as possible.
+        - If the prompt asks to verify anomalies or problems, treat the fix as implicit unless instructed otherwise.
+        - If there is a previous report or a failed check, use it to fix the problems first.
+        - If the workspace does not contain code yet, do not analyze nonexistent errors: plan the initial build from scratch.
+        - No text outside the JSON.
         """
     ).strip()
-    verification_text = "Nessuna verifica iniziale: workspace senza codice esistente."
+    verification_text = "No initial verification: workspace has no existing code."
     if verification:
         verification_lines = [verification["summary"]]
         verification_lines.extend(verification["observations"])
         verification_text = "\n".join(verification_lines)
     user_message = textwrap.dedent(
         f"""
-        Prompt utente:
+        User prompt:
         {user_prompt}
 
-        Iterazione:
+        Iteration:
         {iteration}
 
-        Controllo precedente:
+        Previous check:
         {format_validation_for_prompt(validation)}
 
-        Verifica iniziale:
+        Initial verification:
         {verification_text}
 
-        Modalita':
-        {'costruzione iniziale da zero' if bootstrap_mode else 'verifica, piano e modifiche'}
+        Mode:
+        {'initial build from scratch' if bootstrap_mode else 'verification, plan, and changes'}
 
-        Albero workspace:
+        Workspace tree:
         {workspace_context['tree']}
 
-        Estratti file:
+        File excerpts:
         {workspace_context['excerpts']}
         """
     ).strip()
@@ -909,84 +905,84 @@ def build_plan(config, user_prompt, workspace_context, iteration, validation=Non
     data = extract_json(response)
     plan = data.get("plan")
     if not isinstance(plan, list) or not plan:
-        raise RuntimeError("Il piano generato non contiene una lista valida di punti.")
+        raise RuntimeError("The generated plan does not contain a valid list of items.")
     return [str(item).strip() for item in plan if str(item).strip()]
 
 
 def build_actions(config, user_prompt, plan, workspace_context, iteration, validation=None, verification=None):
     plan_text = "\n".join(f"- {item}" for item in plan)
-    verification_text = "Nessuna verifica iniziale disponibile."
+    verification_text = "No initial verification available."
     if verification:
         verification_lines = [verification["summary"]]
         verification_lines.extend(verification["observations"])
         verification_text = "\n".join(verification_lines)
     system_prompt = textwrap.dedent(
         """
-        Sei un agente di codice minimale.
-        Devi produrre solo JSON valido con questo schema:
+        You are a minimal code agent.
+        Produce only valid JSON with this schema:
         {
-          "summary": "breve sintesi",
+          "summary": "short summary",
           "actions": [
             {
               "type": "write_file",
-              "path": "percorso/relativo.ext",
-              "content": "contenuto completo"
+              "path": "relative/path.ext",
+              "content": "complete content"
             }
           ],
-          "notes": ["nota 1", "nota 2"]
+          "notes": ["note 1", "note 2"]
         }
-        Tipi ammessi:
-        - write_file: crea o sovrascrive un file con il contenuto completo.
-        - append_file: aggiunge testo in coda a un file.
-        - delete_file: elimina un file.
-        Regole:
-        - Usa solo percorsi relativi.
-        - Mantieni la soluzione il piu' semplice possibile.
-        - Non toccare .config, specs.txt, report.txt, README.md o percorsi fuori dal repository.
-        - Se modifichi un file esistente con write_file, restituisci l'intero contenuto.
-        - Se nessun file va modificato, usa actions come lista vuota.
-        - Se il controllo precedente ha fallito, correggi prima quei problemi.
-        - Se il prompt parla di verificare anomalie o problemi, considera implicita anche la correzione salvo istruzioni contrarie.
-        - Se il workspace non contiene ancora codice, crea i file iniziali minimi necessari per soddisfare il prompt.
-        - Scrivi note e summary in italiano.
-        - Nessun testo fuori dal JSON.
+        Allowed types:
+        - write_file: create or overwrite a file with the complete content.
+        - append_file: append text to a file.
+        - delete_file: delete a file.
+        Rules:
+        - Use only relative paths.
+        - Keep the solution as simple as possible.
+        - Do not touch .config, specs.txt, report.txt, README.md, or paths outside the repository.
+        - If you modify an existing file with write_file, return the full content.
+        - If no file should be modified, use an empty actions list.
+        - If the previous check failed, fix those problems first.
+        - If the prompt asks to verify anomalies or problems, treat the fix as implicit unless instructed otherwise.
+        - If the workspace does not contain code yet, create the minimum initial files needed to satisfy the prompt.
+        - Write notes and summary in English.
+        - No text outside the JSON.
         """
     ).strip()
     user_message = textwrap.dedent(
         f"""
-        Prompt utente:
+        User prompt:
         {user_prompt}
 
-        Iterazione:
+        Iteration:
         {iteration}
 
-        Piano:
+        Plan:
         {plan_text}
 
-        Controllo precedente:
+        Previous check:
         {format_validation_for_prompt(validation)}
 
-        Verifica iniziale:
+        Initial verification:
         {verification_text}
 
-        Albero workspace:
+        Workspace tree:
         {workspace_context['tree']}
 
-        Estratti file:
+        File excerpts:
         {workspace_context['excerpts']}
         """
     ).strip()
     response = ollama_chat(config, system_prompt, user_message)
     data = extract_json(response)
     if not isinstance(data, dict):
-        raise RuntimeError("La risposta del modello per le azioni non e' un oggetto JSON.")
+        raise RuntimeError("The model response for actions is not a JSON object.")
     actions = data.get("actions", [])
     if not isinstance(actions, list):
-        raise RuntimeError("Il campo actions non e' una lista.")
+        raise RuntimeError("The actions field is not a list.")
     notes = data.get("notes", [])
     if not isinstance(notes, list):
         notes = [str(notes)]
-    summary = str(data.get("summary", "")).strip() or "Nessuna sintesi fornita."
+    summary = str(data.get("summary", "")).strip() or "No summary provided."
     return {
         "summary": summary,
         "actions": actions,
@@ -997,24 +993,24 @@ def build_actions(config, user_prompt, plan, workspace_context, iteration, valid
 def safe_target_path(repo_path, relative_path):
     target = Path(relative_path)
     if target.is_absolute():
-        raise RuntimeError(f"Percorso assoluto non consentito: {relative_path}")
+        raise RuntimeError(f"Absolute path not allowed: {relative_path}")
     resolved = (repo_path / target).resolve()
     try:
         resolved.relative_to(repo_path.resolve())
     except ValueError as exc:
-        raise RuntimeError(f"Percorso fuori repository non consentito: {relative_path}") from exc
+        raise RuntimeError(f"Path outside the repository is not allowed: {relative_path}") from exc
     if resolved.name == CONFIG_FILE:
-        raise RuntimeError(f"Modifica non consentita su {CONFIG_FILE}")
+        raise RuntimeError(f"Changes to {CONFIG_FILE} are not allowed")
     if resolved.name == REPORT_FILE:
-        raise RuntimeError(f"Modifica non consentita su {REPORT_FILE}")
+        raise RuntimeError(f"Changes to {REPORT_FILE} are not allowed")
     if resolved.name == LEGACY_REPORT_FILE:
-        raise RuntimeError(f"Modifica non consentita su {LEGACY_REPORT_FILE}")
+        raise RuntimeError(f"Changes to {LEGACY_REPORT_FILE} are not allowed")
     if resolved.name == SPECS_FILE:
-        raise RuntimeError(f"Modifica non consentita su {SPECS_FILE}")
+        raise RuntimeError(f"Changes to {SPECS_FILE} are not allowed")
     if resolved.name == README_FILE:
-        raise RuntimeError(f"Modifica non consentita su {README_FILE}")
+        raise RuntimeError(f"Changes to {README_FILE} are not allowed")
     if ".git" in resolved.parts:
-        raise RuntimeError(f"Modifica non consentita sotto .git: {relative_path}")
+        raise RuntimeError(f"Changes under .git are not allowed: {relative_path}")
     return resolved
 
 
@@ -1022,11 +1018,11 @@ def prepare_actions(repo_path, actions):
     prepared_actions = []
     for raw_action in actions:
         if not isinstance(raw_action, dict):
-            raise RuntimeError(f"Azione non valida: {raw_action}")
+            raise RuntimeError(f"Invalid action: {raw_action}")
         action_type = raw_action.get("type")
         relative_path = raw_action.get("path")
         if not action_type or not relative_path:
-            raise RuntimeError(f"Azione incompleta: {raw_action}")
+            raise RuntimeError(f"Incomplete action: {raw_action}")
         target = safe_target_path(repo_path, str(relative_path))
         if action_type == "write_file":
             content = str(raw_action.get("content", ""))
@@ -1035,7 +1031,7 @@ def prepare_actions(repo_path, actions):
         elif action_type == "delete_file":
             content = None
         else:
-            raise RuntimeError(f"Tipo azione non supportato: {action_type}")
+            raise RuntimeError(f"Unsupported action type: {action_type}")
         prepared_actions.append(
             {
                 "type": action_type,
@@ -1108,10 +1104,10 @@ def create_report(
         f"REPORT {APP_NAME.upper()} ({APP_ABBR})",
         "=" * 48,
         "",
-        "ITERAZIONE",
+        "ITERATION",
         f"{iteration}/{total_iterations}",
         "",
-        "SPECIFICHE",
+        "SPECS",
         "-" * 48,
         user_prompt,
         "",
@@ -1119,7 +1115,7 @@ def create_report(
     if verification:
         report.extend(
             [
-                "VERIFICA INIZIALE",
+                "INITIAL VERIFICATION",
                 "-" * 48,
                 verification["summary"],
             ]
@@ -1127,19 +1123,19 @@ def create_report(
         if verification["observations"]:
             report.extend([f"- {item}" for item in verification["observations"]])
         else:
-            report.append("- Nessuna osservazione aggiuntiva.")
-        report.append("")
+            report.append("- No additional observations.")
+    report.append("")
     report.extend(
         [
-        "PIANO",
-        "-" * 48,
+            "PLAN",
+            "-" * 48,
         ]
     )
     report.extend([f"{idx}. {item}" for idx, item in enumerate(plan, start=1)])
     report.extend(
         [
             "",
-            "SINTESI",
+            "SUMMARY",
             "-" * 48,
             execution["summary"],
             "",
@@ -1150,33 +1146,33 @@ def create_report(
     if execution["notes"]:
         report.extend([f"- {note}" for note in execution["notes"]])
     else:
-        report.append("- Nessuna nota aggiuntiva.")
+        report.append("- No additional notes.")
     report.extend(
         [
             "",
-            "EFFETTI",
+            "EFFECTS",
             "-" * 48,
-            f"- Modalita': {'costruzione iniziale da zero' if bootstrap_mode else 'verifica, piano e modifiche'}",
-            f"- File toccati: {', '.join(changed_files) if changed_files else 'nessuno'}",
+            f"- Mode: {'initial build from scratch' if bootstrap_mode else 'verification, plan, and changes'}",
+            f"- Changed files: {', '.join(changed_files) if changed_files else 'none'}",
             "",
-            "CONTROLLO CODICE",
+            "CODE CHECK",
             "-" * 48,
-            f"Esito: {'ok' if validation['ok'] else 'errore'}",
+            f"Result: {'ok' if validation['ok'] else 'error'}",
             "",
         ]
     )
     if validation["checks"]:
         for check in validation["checks"]:
-            report.append(f"- {check['name']}: {'ok' if check['ok'] else 'errore'}")
+            report.append(f"- {check['name']}: {'ok' if check['ok'] else 'error'}")
             details = str(check.get("details", "")).strip()
             if details:
-                report.extend(["  dettagli:", textwrap.indent(details, "    "), ""])
+                report.extend(["  details:", textwrap.indent(details, "    "), ""])
     else:
-        report.append("- Nessun controllo automatico applicabile.")
+        report.append("- No automatic checks applicable.")
     try:
         report_path.write_text("\n".join(report).rstrip() + "\n", encoding="utf-8")
     except OSError as exc:
-        raise RuntimeError(f"Impossibile scrivere {REPORT_FILE}: {explain_missing_path(exc, report_path)}") from exc
+        raise RuntimeError(f"Unable to write {REPORT_FILE}: {explain_missing_path(exc, report_path)}") from exc
     return report_path
 
 
@@ -1224,7 +1220,7 @@ def validate_html_file(path, repo_path):
         return make_check_result(
             f"html5 {rel}",
             False,
-            "DOCTYPE HTML5 mancante. Inserisci <!DOCTYPE html> all'inizio del file.",
+            "Missing HTML5 DOCTYPE. Add <!DOCTYPE html> at the beginning of the file.",
         )
 
     parser = BasicHTML5Parser()
@@ -1235,7 +1231,7 @@ def validate_html_file(path, repo_path):
         return make_check_result(f"html5 {rel}", False, str(exc))
 
     if "<html" not in stripped:
-        return make_check_result(f"html5 {rel}", False, "Tag <html> mancante.")
+        return make_check_result(f"html5 {rel}", False, "Missing <html> tag.")
 
     return make_check_result(f"html5 {rel}", True, "")
 
@@ -1296,7 +1292,7 @@ def run_code_checks(repo_path, changed_files):
             make_check_result(
                 "javascript",
                 False,
-                "Node.js non disponibile: impossibile eseguire il controllo sintattico JavaScript.",
+                "Node.js is not available: unable to run the JavaScript syntax check.",
             )
         )
 
@@ -1337,8 +1333,8 @@ def main():
         repo_path = Path.cwd()
     except FileNotFoundError as exc:
         raise SystemExit(
-            "Workspace corrente non trovato. "
-            "Probabile directory rimossa o rinominata mentre `oc` era in esecuzione."
+            "Current workspace not found. "
+            "The directory was probably removed or renamed while `oc` was running."
         ) from exc
     println(info_text("Workspace:") + f" {format_path(repo_path)}")
 
@@ -1349,13 +1345,13 @@ def main():
     config, config_created = load_or_create_config(repo_path)
     print_ollama_banner(config)
     if config_created:
-        println(info_text("Configurazione salvata in") + f" {format_path(CONFIG_FILE)}.")
+        println(info_text("Configuration saved to") + f" {format_path(CONFIG_FILE)}.")
     readme_path = create_readme(repo_path)
-    println(info_text("README aggiornato in") + f" {format_path(README_FILE)}.")
+    println(info_text("README updated at") + f" {format_path(README_FILE)}.")
 
     user_prompt = load_specs_prompt(repo_path)
     if not user_prompt:
-        raise SystemExit(f"{SPECS_FILE} vuoto.")
+        raise SystemExit(f"{SPECS_FILE} is empty.")
 
     code_files = list_workspace_code_files(repo_path)
     bootstrap_mode = not bool(code_files)
@@ -1365,23 +1361,23 @@ def main():
     workspace_context = collect_workspace_context(repo_path)
     if bootstrap_mode:
         println("")
-        println(section_title("Bootstrap iniziale"))
-        println(info_text("Nessun codice esistente rilevato. Pianificazione e costruzione iniziale.\n"))
+        println(section_title("Initial Bootstrap"))
+        println(info_text("No existing code detected. Planning and building from scratch.\n"))
     else:
         println("")
-        println(section_title("Verifica iniziale del codice"))
+        println(section_title("Initial Code Verification"))
         println(muted(rule()))
         initial_validation = run_code_checks(repo_path, code_files)
         try:
             verification = run_model_step(
-                "Verifica iniziale",
+                "Initial verification",
                 lambda: build_verification(config, user_prompt, workspace_context, initial_validation),
             )
             println(verification["summary"])
             for item in verification["observations"]:
                 println("- " + item)
         except Exception as exc:
-            println(warning_text("Verifica iniziale non disponibile:") + f" {exc}")
+            println(warning_text("Initial verification unavailable:") + f" {exc}")
             verification = None
 
     validation = None
@@ -1395,12 +1391,12 @@ def main():
     for iteration in range(1, max_iterations + 1):
         workspace_context = collect_workspace_context(repo_path)
         println("")
-        println(section_title(f"Iterazione {iteration}/{max_iterations}"))
+        println(section_title(f"Iteration {iteration}/{max_iterations}"))
         println(muted(rule()))
         current_validation = validation if validation is not None else initial_validation
         try:
             plan = run_model_step(
-                "Pianificazione",
+                "Planning",
                 lambda: build_plan(
                     config,
                     user_prompt,
@@ -1413,20 +1409,20 @@ def main():
             )
         except Exception as exc:
             last_model_error = exc
-            println(error_text("Errore del modello:") + f" {exc}")
+            println(error_text("Model error:") + f" {exc}")
             if iteration < max_iterations:
-                println(info_text("\nIl modello non ha prodotto un piano valido, nuova iterazione in corso...\n"))
+                println(info_text("\nThe model did not produce a valid plan, starting a new iteration...\n"))
                 continue
             break
         for idx, item in enumerate(plan, start=1):
             println(f"{paint(str(idx), TERM_STYLES['note'])}. {item}")
 
         println("")
-        println(section_title("Applicazione modifiche"))
+        println(section_title("Applying Changes"))
         println(muted(rule()))
         try:
             execution, changed_files = run_model_step(
-                "Generazione modifiche",
+                "Generating changes",
                 lambda: build_and_apply_actions(
                     repo_path,
                     config,
@@ -1440,9 +1436,9 @@ def main():
             )
         except Exception as exc:
             last_model_error = exc
-            println(error_text("Errore del modello:") + f" {exc}")
+            println(error_text("Model error:") + f" {exc}")
             if iteration < max_iterations:
-                println(info_text("\nIl modello non ha prodotto modifiche valide, nuova iterazione in corso...\n"))
+                println(info_text("\nThe model did not produce valid changes, starting a new iteration...\n"))
                 continue
             break
         validation = run_code_checks(repo_path, changed_files)
@@ -1462,45 +1458,45 @@ def main():
         )
 
         println("")
-        println(section_title("Controllo del codice"))
+        println(section_title("Code Check"))
         println(muted(rule()))
         if validation["checks"]:
             for check in validation["checks"]:
                 println(format_check_line(check))
         else:
-            println("- " + muted("Nessun controllo automatico applicabile."))
+            println("- " + muted("No automatic checks applicable."))
 
         if validation["ok"]:
             break
         if iteration < MAX_ITERATIONS:
             println("")
-            println(warning_text("Controllo fallito, nuova iterazione in corso.\n"))
+            println(warning_text("Check failed, starting a new iteration.\n"))
 
     if validation is None:
-        reason = compact_error_message(last_model_error) if last_model_error else "nessun dettaglio disponibile"
-        raise RuntimeError(f"Nessuna iterazione completata con successo. Ultimo errore modello: {reason}")
+        reason = compact_error_message(last_model_error) if last_model_error else "no details available"
+        raise RuntimeError(f"No iteration completed successfully. Last model error: {reason}")
 
     println("")
-    println(section_title("Sintesi"))
+    println(section_title("Summary"))
     println(muted(rule()))
     println(execution["summary"])
     println("")
-    println(section_title("File salvati"))
+    println(section_title("Saved Files"))
     if changed_files:
         for path in changed_files:
             println(f"- {format_path(path)}")
     else:
-        println("- " + muted("Nessun file modificato dal modello."))
-    println("- " + info_text("Specifiche:") + f" {format_path(SPECS_FILE)}")
+        println("- " + muted("No files modified by the model."))
+    println("- " + info_text("Specs:") + f" {format_path(SPECS_FILE)}")
     println(
         "- "
         + info_text("Report:")
-        + f" {format_path(report_path.name) if report_path.exists() else muted('non generato')}"
+        + f" {format_path(report_path.name) if report_path.exists() else muted('not generated')}"
     )
     println("- " + info_text("README:") + f" {format_path(readme_path.name)}")
-    println("- " + info_text("Controllo codice:") + f" {format_status(bool(validation and validation['ok']))}")
+    println("- " + info_text("Code check:") + f" {format_status(bool(validation and validation['ok']))}")
     if last_model_error:
-        println("- " + error_text("Ultimo errore modello:") + f" {compact_error_message(last_model_error)}")
+        println("- " + error_text("Last model error:") + f" {compact_error_message(last_model_error)}")
     if validation and not validation["ok"]:
         raise SystemExit(1)
 
@@ -1509,5 +1505,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        println(error_text("Errore:") + f" {exc}")
+        println(error_text("Error:") + f" {exc}")
         sys.exit(1)
