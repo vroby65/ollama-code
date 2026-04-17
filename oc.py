@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import locale
 import os
 import re
 import shlex
@@ -68,6 +69,31 @@ CODE_EXTENSIONS = {
     ".kt",
     ".sql",
 }
+PROTECTED_FILE_NAMES = {
+    CONFIG_FILE,
+    SPECS_FILE,
+    REPORT_FILE,
+    README_FILE,
+    LEGACY_REPORT_FILE,
+}
+IGNORED_DIR_NAMES = {
+    ".git",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+}
+PYTHON_EXTENSIONS = {".py"}
+JAVASCRIPT_EXTENSIONS = {".js", ".mjs", ".cjs"}
+JSON_EXTENSIONS = {".json"}
+HTML_EXTENSIONS = {".html", ".htm"}
+BASH_EXTENSIONS = {".sh", ".bash"}
+ZSH_EXTENSIONS = {".zsh"}
 
 TERM_STYLES = {
     "reset": "0",
@@ -125,6 +151,45 @@ def explain_missing_path(exc, fallback=None):
     if missing:
         return f"file or directory not found: {missing}"
     return "file or directory not found"
+
+
+def normalize_encoding_name(encoding):
+    return str(encoding).lower().replace("_", "-")
+
+
+def text_input_encodings(raw=b""):
+    encodings = ["utf-8-sig", "utf-8"]
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings.append("utf-16")
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        encodings.append(preferred)
+    encodings.extend(["cp1252", "iso-8859-1", "latin-1"])
+
+    result = []
+    seen = set()
+    for encoding in encodings:
+        key = normalize_encoding_name(encoding)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(encoding)
+    return result
+
+
+def read_text_with_fallback(path):
+    raw = path.read_bytes()
+    last_decode_error = None
+    for encoding in text_input_encodings(raw):
+        try:
+            return raw.decode(encoding), encoding
+        except UnicodeDecodeError as exc:
+            last_decode_error = exc
+        except LookupError:
+            continue
+    if last_decode_error:
+        raise last_decode_error
+    return raw.decode("utf-8"), "utf-8"
 
 
 def supports_color(stream=None):
@@ -388,14 +453,18 @@ def load_specs_prompt(repo_path):
             )
 
         try:
-            content = specs_path.read_text(encoding="utf-8").strip()
+            content, encoding = read_text_with_fallback(specs_path)
+            content = content.strip()
         except FileNotFoundError:
             content = ""
         except OSError as exc:
             raise RuntimeError(f"Unable to read {SPECS_FILE}: {explain_missing_path(exc, specs_path)}") from exc
 
         if content:
-            println(info_text("Specs loaded from") + f" {format_path(SPECS_FILE)}.")
+            message = info_text("Specs loaded from") + f" {format_path(SPECS_FILE)}"
+            if normalize_encoding_name(encoding) not in {"utf-8", "utf-8-sig"}:
+                message += " " + muted(f"(decoded as {encoding})")
+            println(message + ".")
             return content
 
         if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -595,18 +664,56 @@ def reset_config_file(repo_path):
         println(info_text("Configuration removed:") + f" {format_path(CONFIG_FILE)}")
 
 
+def relative_workspace_path(repo_path, path):
+    return path.relative_to(repo_path).as_posix()
+
+
+def has_ignored_part(parts):
+    return any(part in IGNORED_DIR_NAMES for part in parts)
+
+
+def read_shebang(path):
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            first_line = handle.readline().strip().lower()
+    except (UnicodeDecodeError, OSError):
+        return ""
+    return first_line if first_line.startswith("#!") else ""
+
+
+def classify_code_file(path):
+    suffix = path.suffix.lower()
+    if suffix in PYTHON_EXTENSIONS:
+        return "python"
+    if suffix in JAVASCRIPT_EXTENSIONS:
+        return "javascript"
+    if suffix in JSON_EXTENSIONS:
+        return "json"
+    if suffix in HTML_EXTENSIONS:
+        return "html"
+    if suffix in BASH_EXTENSIONS:
+        return "bash"
+    if suffix in ZSH_EXTENSIONS:
+        return "zsh"
+
+    if not suffix:
+        shebang = read_shebang(path)
+        if "python" in shebang:
+            return "python"
+        if "zsh" in shebang:
+            return "zsh"
+        if "bash" in shebang or re.search(r"(^#!\S*/sh\b|\s+sh\b)", shebang):
+            return "bash"
+
+    if suffix in CODE_EXTENSIONS:
+        return "code"
+    return None
+
+
 def is_code_file(path):
-    if path.name in {CONFIG_FILE, REPORT_FILE, LEGACY_REPORT_FILE, README_FILE, SPECS_FILE}:
+    if path.name in PROTECTED_FILE_NAMES:
         return False
-    if path.suffix.lower() in CODE_EXTENSIONS:
-        return True
-    if not path.suffix and is_text_file(path):
-        try:
-            first_line = path.read_text(encoding="utf-8").splitlines()[:1]
-        except OSError:
-            return False
-        return bool(first_line and first_line[0].startswith("#!"))
-    return False
+    return classify_code_file(path) is not None
 
 
 def list_workspace_code_files(repo_path):
@@ -618,20 +725,30 @@ def list_workspace_code_files(repo_path):
     for path in paths:
         if path.is_dir():
             continue
-        if ".git" in path.parts or "__pycache__" in path.parts:
+        rel_parts = path.relative_to(repo_path).parts[:-1]
+        if has_ignored_part(rel_parts):
             continue
         if is_code_file(path):
-            files.append(path.relative_to(repo_path).as_posix())
+            files.append(relative_workspace_path(repo_path, path))
     return files
 
 
 def is_text_file(path):
     try:
-        with path.open("r", encoding="utf-8") as handle:
-            handle.read(1024)
-        return True
-    except (UnicodeDecodeError, OSError):
+        raw = path.read_bytes()[:2048]
+    except OSError:
         return False
+    if b"\x00" in raw:
+        return False
+    for encoding in text_input_encodings(raw):
+        try:
+            raw.decode(encoding)
+            return True
+        except UnicodeDecodeError:
+            continue
+        except LookupError:
+            continue
+    return False
 
 
 def collect_workspace_context(repo_path):
@@ -644,13 +761,12 @@ def collect_workspace_context(repo_path):
     for path in paths:
         if path.is_dir():
             continue
-        if ".git" in path.parts:
+        rel_parts = path.relative_to(repo_path).parts[:-1]
+        if has_ignored_part(rel_parts):
             continue
-        if "__pycache__" in path.parts:
+        if path.name in PROTECTED_FILE_NAMES - {REPORT_FILE}:
             continue
-        if path.name in {CONFIG_FILE, README_FILE, SPECS_FILE, LEGACY_REPORT_FILE}:
-            continue
-        rel = path.relative_to(repo_path).as_posix()
+        rel = relative_workspace_path(repo_path, path)
         files.append(rel)
     files.sort(key=lambda rel: (0 if rel == source_name else 1 if rel == REPORT_FILE else 2, rel))
 
@@ -664,7 +780,7 @@ def collect_workspace_context(repo_path):
         if not is_text_file(path):
             continue
         try:
-            content = path.read_text(encoding="utf-8")
+            content, _encoding = read_text_with_fallback(path)
         except OSError:
             continue
         snippet = content[:MAX_FILE_CHARS]
@@ -708,8 +824,15 @@ def ollama_chat(config, system_prompt, user_prompt):
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Unable to contact Ollama at {config['base_url']}: {exc}") from exc
 
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid JSON received from Ollama chat.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Invalid Ollama chat response: expected a JSON object.")
     message = data.get("message", {})
+    if not isinstance(message, dict):
+        raise RuntimeError("Invalid Ollama chat response: missing message object.")
     content = message.get("content", "").strip()
     if not content:
         raise RuntimeError("Empty Ollama response.")
@@ -996,20 +1119,12 @@ def safe_target_path(repo_path, relative_path):
         raise RuntimeError(f"Absolute path not allowed: {relative_path}")
     resolved = (repo_path / target).resolve()
     try:
-        resolved.relative_to(repo_path.resolve())
+        relative_parts = resolved.relative_to(repo_path.resolve()).parts
     except ValueError as exc:
         raise RuntimeError(f"Path outside the repository is not allowed: {relative_path}") from exc
-    if resolved.name == CONFIG_FILE:
-        raise RuntimeError(f"Changes to {CONFIG_FILE} are not allowed")
-    if resolved.name == REPORT_FILE:
-        raise RuntimeError(f"Changes to {REPORT_FILE} are not allowed")
-    if resolved.name == LEGACY_REPORT_FILE:
-        raise RuntimeError(f"Changes to {LEGACY_REPORT_FILE} are not allowed")
-    if resolved.name == SPECS_FILE:
-        raise RuntimeError(f"Changes to {SPECS_FILE} are not allowed")
-    if resolved.name == README_FILE:
-        raise RuntimeError(f"Changes to {README_FILE} are not allowed")
-    if ".git" in resolved.parts:
+    if resolved.name in PROTECTED_FILE_NAMES:
+        raise RuntimeError(f"Changes to {resolved.name} are not allowed")
+    if ".git" in relative_parts:
         raise RuntimeError(f"Changes under .git are not allowed: {relative_path}")
     return resolved
 
@@ -1042,6 +1157,17 @@ def prepare_actions(repo_path, actions):
     return prepared_actions
 
 
+def write_text_if_changed(target, content):
+    if target.exists() and target.is_file():
+        try:
+            if target.read_text(encoding="utf-8") == content:
+                return False
+        except UnicodeDecodeError:
+            pass
+    target.write_text(content, encoding="utf-8")
+    return True
+
+
 def apply_actions(repo_path, actions):
     prepared_actions = prepare_actions(repo_path, actions)
     changed_files = []
@@ -1050,17 +1176,19 @@ def apply_actions(repo_path, actions):
         target = action["target"]
         if action_type == "write_file":
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(action["content"], encoding="utf-8")
-            changed_files.append(str(target.relative_to(repo_path)))
+            if write_text_if_changed(target, action["content"]):
+                changed_files.append(relative_workspace_path(repo_path, target))
         elif action_type == "append_file":
+            if not action["content"]:
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("a", encoding="utf-8") as handle:
                 handle.write(action["content"])
-            changed_files.append(str(target.relative_to(repo_path)))
+            changed_files.append(relative_workspace_path(repo_path, target))
         elif action_type == "delete_file":
             if target.exists():
                 target.unlink()
-                changed_files.append(str(target.relative_to(repo_path)))
+                changed_files.append(relative_workspace_path(repo_path, target))
     return list(dict.fromkeys(changed_files))
 
 
@@ -1258,13 +1386,20 @@ def run_code_checks(repo_path, changed_files):
         path = repo_path / rel
         if path.exists() and path.is_file():
             existing_paths.append(path)
+    existing_paths = list(dict.fromkeys(existing_paths))
 
     checks = []
-    python_files = [path for path in existing_paths if path.suffix == ".py"]
-    shell_files = [path for path in existing_paths if path.suffix == ".sh"]
-    javascript_files = [path for path in existing_paths if path.suffix in {".js", ".mjs", ".cjs"}]
-    json_files = [path for path in existing_paths if path.suffix == ".json"]
-    html_files = [path for path in existing_paths if path.suffix in {".html", ".htm"}]
+    files_by_kind = {}
+    for path in existing_paths:
+        kind = classify_code_file(path)
+        if kind:
+            files_by_kind.setdefault(kind, []).append(path)
+    python_files = files_by_kind.get("python", [])
+    bash_files = files_by_kind.get("bash", [])
+    zsh_files = files_by_kind.get("zsh", [])
+    javascript_files = files_by_kind.get("javascript", [])
+    json_files = files_by_kind.get("json", [])
+    html_files = files_by_kind.get("html", [])
 
     if python_files:
         result = run(
@@ -1302,15 +1437,41 @@ def run_code_checks(repo_path, changed_files):
     for path in html_files:
         checks.append(validate_html_file(path, repo_path))
 
-    if shell_files and command_exists("bash"):
+    if bash_files and command_exists("bash"):
         result = run(
-            ["bash", "-n", *[str(path) for path in shell_files]],
+            ["bash", "-n", *[str(path) for path in bash_files]],
             cwd=repo_path,
             check=False,
             timeout=120,
         )
         details = result.stderr.strip() or result.stdout.strip()
         checks.append(make_check_result("bash -n", result.returncode == 0, details))
+    elif bash_files:
+        checks.append(
+            make_check_result(
+                "bash -n",
+                False,
+                "Bash is not available: unable to run the shell syntax check.",
+            )
+        )
+
+    if zsh_files and command_exists("zsh"):
+        result = run(
+            ["zsh", "-n", *[str(path) for path in zsh_files]],
+            cwd=repo_path,
+            check=False,
+            timeout=120,
+        )
+        details = result.stderr.strip() or result.stdout.strip()
+        checks.append(make_check_result("zsh -n", result.returncode == 0, details))
+    elif zsh_files:
+        checks.append(
+            make_check_result(
+                "zsh -n",
+                False,
+                "Zsh is not available: unable to run the shell syntax check.",
+            )
+        )
 
     if (
         python_files
@@ -1326,6 +1487,14 @@ def run_code_checks(repo_path, changed_files):
         "ok": all(check["ok"] for check in checks) if checks else True,
         "checks": checks,
     }
+
+
+def validation_targets_after_changes(repo_path, changed_files, previous_validation=None):
+    changed_files = list(dict.fromkeys(changed_files))
+    previous_failed = bool(previous_validation and not previous_validation.get("ok", True))
+    if previous_failed:
+        return list(dict.fromkeys([*list_workspace_code_files(repo_path), *changed_files]))
+    return changed_files
 
 
 def main():
@@ -1441,7 +1610,8 @@ def main():
                 println(info_text("\nThe model did not produce valid changes, starting a new iteration...\n"))
                 continue
             break
-        validation = run_code_checks(repo_path, changed_files)
+        validation_targets = validation_targets_after_changes(repo_path, changed_files, current_validation)
+        validation = run_code_checks(repo_path, validation_targets)
         last_model_error = None
 
         report_path = create_report(
